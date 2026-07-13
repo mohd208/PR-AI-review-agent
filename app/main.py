@@ -32,9 +32,9 @@ async def healthz():
     return {"status": "ok"}
 
 
-async def review_pr(repo: str, number: int, branch: str, title: str) -> None:
+async def review_pr(repo: str, number: int, branch: str, title: str, head_repo: str) -> None:
     files = await GitHub(settings().github_token, repo).pr_files(number)
-    await repair_pr(repo, number, branch, title, files, settings())
+    await repair_pr(repo, number, branch, title, files, settings(), head_repo)
 
 
 @app.post("/webhooks/github", status_code=202)
@@ -49,9 +49,12 @@ async def webhook(request: Request, background_tasks: BackgroundTasks, x_github_
 
     if x_github_event == "pull_request" and payload.get("action") in {"opened", "synchronize", "reopened"}:
         pr = payload["pull_request"]
-        same_repository = pr.get("head", {}).get("repo", {}).get("full_name", "").lower() == repo
-        if pr.get("user", {}).get("login") != "pr-autofix-agent[bot]" and same_repository:
-            background_tasks.add_task(review_pr, repo, pr["number"], pr["head"]["ref"], pr["title"])
+        is_bot_pr = pr.get("user", {}).get("login") == "pr-autofix-agent[bot]"
+        # Review the bot's own autofix PRs too, but only once on creation — otherwise our own
+        # fix commit fires "synchronize" and we'd re-review (and re-push) ourselves forever.
+        if not is_bot_pr or payload["action"] == "opened":
+            head_repo = pr.get("head", {}).get("repo", {}).get("full_name", "")
+            background_tasks.add_task(review_pr, repo, pr["number"], pr["head"]["ref"], pr["title"], head_repo)
     elif x_github_event == "workflow_run":
         run = payload["workflow_run"]
         if payload.get("action") == "completed" and run.get("conclusion") == "failure" and run.get("event") == "push":

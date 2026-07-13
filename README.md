@@ -11,8 +11,9 @@ It keeps operating as GitHub sends new PR and CI events. The service does not me
 
 - Allowlisted repositories only (`ALLOWED_REPOSITORIES`).
 - Signed GitHub webhooks only.
-- Ignores its own PR events to avoid recursive PR reviews.
+- Reviews its own autofix PRs exactly once, on creation, so a review's own push can't trigger another review (no infinite loop).
 - Gives Claude a narrow repair task and requires small, safe changes; commits happen only when the working tree changed.
+- Fork PRs are reviewed too; if the fix can't be pushed back to the fork (no "Allow edits from maintainers"), the PR comment explains why instead of failing silently.
 - Use a GitHub App token in production. Avoid a personal token with broad access.
 
 ## Server setup

@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 
 from .config import Settings
-from .github import GitHub
+from .github import GitHub, PushRejected
 
 SYSTEM_RULES = """You are a careful repository repair agent. Work only on the stated issue.
 Inspect the repository and make the smallest correct fix. Never modify credentials, lockfiles
@@ -30,11 +30,11 @@ async def invoke_claude(directory: Path, task: str, config: Settings) -> str:
     return output.decode(errors="replace")[-12000:]
 
 
-async def repair_pr(repo: str, number: int, branch: str, title: str, files: list[dict], config: Settings) -> None:
+async def repair_pr(repo: str, number: int, branch: str, title: str, files: list[dict], config: Settings, head_repo: str | None = None) -> None:
     gh = GitHub(config.github_token, repo)
     changed = "\n".join(f"- {item['filename']} ({item['status']})" for item in files[:100])
     task = f"Review pull request #{number}: {title}\nChanged files:\n{changed}\nFind and safely fix actual defects in this PR."
-    await _run_repair(gh, number, branch, task, f"fix: address automated review for PR #{number}", config)
+    await _run_repair(gh, number, branch, task, f"fix: address automated review for PR #{number}", config, clone_repo=head_repo)
 
 
 async def repair_failed_run(repo: str, run_id: int, branch: str, base: str, name: str, config: Settings) -> None:
@@ -45,16 +45,23 @@ async def repair_failed_run(repo: str, run_id: int, branch: str, base: str, name
     await _run_repair(gh, None, branch, task, f"fix(ci): repair failed workflow run {run_id}", config, repair_branch, base)
 
 
-async def _run_repair(gh: GitHub, pr_number: int | None, source_branch: str, task: str, commit_message: str, config: Settings, push_branch: str | None = None, base: str | None = None) -> None:
+async def _run_repair(gh: GitHub, pr_number: int | None, source_branch: str, task: str, commit_message: str, config: Settings, push_branch: str | None = None, base: str | None = None, clone_repo: str | None = None) -> None:
     directory = Path(tempfile.mkdtemp(prefix="pr-autofix-"))
     target_branch = push_branch or source_branch
     try:
-        gh.clone_branch(source_branch, directory)
+        gh.clone_branch(source_branch, directory, repo=clone_repo)
         if push_branch:
             subprocess = __import__("subprocess")
             subprocess.run(["git", "checkout", "-b", push_branch], cwd=directory, check=True)
         result = await invoke_claude(directory, task, config)
-        pushed = gh.commit_and_push(directory, target_branch, commit_message)
+        try:
+            pushed = gh.commit_and_push(directory, target_branch, commit_message)
+        except PushRejected as exc:
+            pushed = False
+            result += (
+                f"\n\n(A fix was computed but could not be pushed: {exc}\n"
+                "This usually means the PR is from a fork without \"Allow edits from maintainers\" enabled.)"
+            )
         if pr_number:
             status = "I pushed a focused repair commit." if pushed else "I found no safe code change to push."
             await gh.comment(pr_number, f"🤖 **PR AutoFix Agent**\n\n{status}\n\nClaude report:\n```text\n{result}\n```")

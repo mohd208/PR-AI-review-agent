@@ -4,6 +4,10 @@ from pathlib import Path
 import httpx
 
 
+class PushRejected(Exception):
+    """Raised when a computed fix could not be pushed (e.g. no write access to a fork branch)."""
+
+
 class GitHub:
     def __init__(self, token: str, repo: str):
         self.repo = repo
@@ -34,9 +38,9 @@ class GitHub:
         )
         return (result.stdout + "\n" + result.stderr)[-50000:]
 
-    def clone_branch(self, branch: str, destination: Path) -> None:
+    def clone_branch(self, branch: str, destination: Path, repo: str | None = None) -> None:
         token = self.headers["Authorization"].split(" ", 1)[1]
-        url = f"https://x-access-token:{token}@github.com/{self.repo}.git"
+        url = f"https://x-access-token:{token}@github.com/{repo or self.repo}.git"
         subprocess.run(["git", "clone", "--depth", "1", "--branch", branch, url, str(destination)], check=True, timeout=180)
         subprocess.run(["git", "config", "user.name", "pr-autofix-agent[bot]"], cwd=destination, check=True)
         subprocess.run(["git", "config", "user.email", "pr-autofix-agent[bot]@users.noreply.github.com"], cwd=destination, check=True)
@@ -47,7 +51,9 @@ class GitHub:
         if not changed:
             return False
         subprocess.run(["git", "commit", "-m", message], cwd=directory, check=True, timeout=120)
-        subprocess.run(["git", "push", "origin", f"HEAD:{branch}"], cwd=directory, check=True, timeout=180)
+        push = subprocess.run(["git", "push", "origin", f"HEAD:{branch}"], cwd=directory, capture_output=True, text=True, timeout=180)
+        if push.returncode != 0:
+            raise PushRejected(push.stderr.strip()[-2000:])
         return True
 
     async def create_pr(self, head: str, base: str, title: str, body: str) -> dict:
