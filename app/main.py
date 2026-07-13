@@ -6,7 +6,7 @@ import sys
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
-from .agent import repair_failed_run, repair_pr
+from .agent import handle_workflow_failure, repair_pr
 from .config import settings
 from .github import GitHub
 
@@ -49,14 +49,14 @@ async def webhook(request: Request, background_tasks: BackgroundTasks, x_github_
 
     if x_github_event == "pull_request" and payload.get("action") in {"opened", "synchronize", "reopened"}:
         pr = payload["pull_request"]
-        is_bot_pr = pr.get("user", {}).get("login") == "pr-autofix-agent[bot]"
+        is_bot_pr = pr.get("user", {}).get("login") == settings().bot_login
         # Review the bot's own autofix PRs too, but only once on creation — otherwise our own
         # fix commit fires "synchronize" and we'd re-review (and re-push) ourselves forever.
         if not is_bot_pr or payload["action"] == "opened":
             head_repo = pr.get("head", {}).get("repo", {}).get("full_name", "")
             background_tasks.add_task(review_pr, repo, pr["number"], pr["head"]["ref"], pr["title"], head_repo)
-    elif x_github_event == "workflow_run":
+    elif x_github_event == "workflow_run" and payload.get("action") == "completed":
         run = payload["workflow_run"]
-        if payload.get("action") == "completed" and run.get("conclusion") == "failure" and run.get("event") == "push":
-            background_tasks.add_task(repair_failed_run, repo, run["id"], run["head_branch"], payload["repository"]["default_branch"], run["name"], settings())
+        if run.get("conclusion") == "failure":
+            background_tasks.add_task(handle_workflow_failure, repo, run, settings())
     return {"accepted": True}

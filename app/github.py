@@ -26,6 +26,16 @@ class GitHub:
     async def pr_files(self, number: int) -> list[dict]:
         return await self.request("GET", f"/repos/{self.repo}/pulls/{number}/files", params={"per_page": 100})
 
+    async def find_pr_by_branch(self, branch: str) -> dict | None:
+        owner = self.repo.split("/")[0]
+        results = await self.request(
+            "GET", f"/repos/{self.repo}/pulls", params={"head": f"{owner}:{branch}", "state": "open"}
+        )
+        return results[0] if results else None
+
+    async def set_labels(self, number: int, labels: list[str]) -> None:
+        await self.request("PUT", f"/repos/{self.repo}/issues/{number}/labels", json={"labels": labels})
+
     async def comment(self, number: int, body: str) -> None:
         await self.request("POST", f"/repos/{self.repo}/issues/{number}/comments", json={"body": body})
 
@@ -58,4 +68,3 @@ class GitHub:
 
     async def create_pr(self, head: str, base: str, title: str, body: str) -> dict:
         return await self.request("POST", f"/repos/{self.repo}/pulls", json={"title": title, "head": head, "base": base, "body": body})
-
