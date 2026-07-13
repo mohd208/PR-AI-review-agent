@@ -1,7 +1,10 @@
+import logging
 import subprocess
 from pathlib import Path
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 class PushRejected(Exception):
@@ -40,12 +43,15 @@ class GitHub:
         await self.request("POST", f"/repos/{self.repo}/issues/{number}/comments", json={"body": body})
 
     async def workflow_logs(self, run_id: int) -> str:
+        logger.info("Fetching failed-job logs for run %s (%s)", run_id, self.repo)
         # GitHub redirects this endpoint to a ZIP archive. gh handles the download reliably.
         result = subprocess.run(
             ["gh", "run", "view", str(run_id), "--repo", self.repo, "--log-failed"],
             capture_output=True, text=True, timeout=120, check=False,
             env={**__import__("os").environ, "GH_TOKEN": self.headers["Authorization"].split(" ", 1)[1]},
         )
+        if result.returncode != 0:
+            logger.warning("gh run view failed for run %s: %s", run_id, result.stderr.strip()[-500:])
         return (result.stdout + "\n" + result.stderr)[-50000:]
 
     def clone_branch(self, branch: str, destination: Path, repo: str | None = None) -> None:
@@ -54,16 +60,20 @@ class GitHub:
         subprocess.run(["git", "clone", "--depth", "1", "--branch", branch, url, str(destination)], check=True, timeout=180)
         subprocess.run(["git", "config", "user.name", "pr-autofix-agent[bot]"], cwd=destination, check=True)
         subprocess.run(["git", "config", "user.email", "pr-autofix-agent[bot]@users.noreply.github.com"], cwd=destination, check=True)
+        logger.info("Clone complete: %s@%s -> %s", repo or self.repo, branch, destination)
 
     def commit_and_push(self, directory: Path, branch: str, message: str) -> bool:
         subprocess.run(["git", "add", "-A"], cwd=directory, check=True)
         changed = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=directory, check=False).returncode != 0
         if not changed:
+            logger.info("No working-tree changes in %s; nothing to commit", directory)
             return False
         subprocess.run(["git", "commit", "-m", message], cwd=directory, check=True, timeout=120)
+        logger.info("Committed changes in %s: %s", directory, message)
         push = subprocess.run(["git", "push", "origin", f"HEAD:{branch}"], cwd=directory, capture_output=True, text=True, timeout=180)
         if push.returncode != 0:
             raise PushRejected(push.stderr.strip()[-2000:])
+        logger.info("Pushed to %s", branch)
         return True
 
     async def create_pr(self, head: str, base: str, title: str, body: str) -> dict:

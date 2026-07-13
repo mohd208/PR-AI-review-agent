@@ -1,12 +1,16 @@
 import asyncio
+import logging
 import re
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 from .config import Settings
 from .github import GitHub, PushRejected
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_RULES = """You are a careful repository repair agent working non-interactively. Work only
 on the stated issue and make the smallest correct fix.
@@ -57,6 +61,8 @@ def _labels_with(pr: dict, new_label: str) -> list[str]:
 
 async def invoke_claude(directory: Path, task: str, config: Settings) -> str:
     prompt = f"{SYSTEM_RULES}\n\nTask:\n{task}"
+    logger.info("Invoking Claude Code in %s (timeout=%ds)", directory, config.claude_timeout_seconds)
+    started = time.monotonic()
     process = await asyncio.create_subprocess_exec(
         config.claude_command, "-p", prompt, "--dangerously-skip-permissions",
         cwd=directory, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
@@ -66,7 +72,9 @@ async def invoke_claude(directory: Path, task: str, config: Settings) -> str:
     except TimeoutError:
         process.kill()
         await process.communicate()
+        logger.warning("Claude Code timed out after %.0fs in %s", time.monotonic() - started, directory)
         return "Claude timed out before completing a fix."
+    logger.info("Claude Code finished in %.0fs (exit=%s) in %s", time.monotonic() - started, process.returncode, directory)
     return output.decode(errors="replace")[-12000:]
 
 
@@ -77,14 +85,17 @@ async def _apply_fix(
     directory = Path(tempfile.mkdtemp(prefix="pr-autofix-"))
     target_branch = push_branch or source_branch
     try:
+        logger.info("Cloning %s (repo=%s) into %s", source_branch, clone_repo or gh.repo, directory)
         gh.clone_branch(source_branch, directory, repo=clone_repo)
         if push_branch:
             subprocess.run(["git", "checkout", "-b", push_branch], cwd=directory, check=True)
         result = await invoke_claude(directory, task, config)
         try:
             pushed = gh.commit_and_push(directory, target_branch, commit_message)
+            logger.info("Push to %s: %s", target_branch, "changes pushed" if pushed else "no changes to push")
         except PushRejected as exc:
             pushed = False
+            logger.warning("Push to %s rejected: %s", target_branch, exc)
             result += (
                 f"\n\n(A fix was computed but could not be pushed: {exc}\n"
                 "This usually means the branch is on a fork without \"Allow edits from maintainers\" enabled.)"
@@ -115,9 +126,16 @@ async def handle_workflow_failure(repo: str, run: dict, config: Settings) -> Non
     async with _lock_for(f"{repo}:{branch_name}"):
         existing_pr = await gh.find_pr_by_branch(branch_name)
         if existing_pr:
+            logger.info("Workflow failure: retry path for %s#%d (branch=%s)", repo, existing_pr["number"], branch_name)
             await _retry_autofix(gh, existing_pr, branch_name, run, config)
         elif run.get("event") == "push":
+            logger.info("Workflow failure: creating autofix PR on %s (branch=%s)", repo, branch_name)
             await _create_autofix_pr(gh, branch_name, run, config)
+        else:
+            logger.info(
+                "Workflow failure: no existing autofix PR and event=%s (not push) for %s, ignoring",
+                run.get("event"), repo,
+            )
 
 
 async def _create_autofix_pr(gh: GitHub, branch_name: str, run: dict, config: Settings) -> None:
@@ -128,6 +146,7 @@ async def _create_autofix_pr(gh: GitHub, branch_name: str, run: dict, config: Se
         gh, base_branch, task, f"fix(ci): repair failed workflow {run['name']}", config, push_branch=branch_name
     )
     if not pushed:
+        logger.info("Autofix for %s: no safe fix found, not creating a PR", run["name"])
         return
     pr = await gh.create_pr(
         branch_name, base_branch, f"fix(ci): repair {run['name']}",
@@ -138,11 +157,13 @@ async def _create_autofix_pr(gh: GitHub, branch_name: str, run: dict, config: Se
         pr["number"],
         f"🤖 This PR was opened automatically after a post-merge CI failure (attempt 1/{config.max_autofix_attempts}).",
     )
+    logger.info("Autofix PR opened for %s: %s#%d", run["name"], gh.repo, pr["number"])
 
 
 async def _retry_autofix(gh: GitHub, pr: dict, branch_name: str, run: dict, config: Settings) -> None:
     attempt = _attempt_number(pr)
     if attempt >= config.max_autofix_attempts:
+        logger.info("Autofix %s#%d: attempt cap (%d) reached, not retrying", gh.repo, pr["number"], config.max_autofix_attempts)
         if not any(label["name"] == "autofix-exhausted" for label in pr.get("labels", [])):
             await gh.set_labels(pr["number"], _labels_with(pr, "autofix-exhausted"))
             await gh.comment(
@@ -153,6 +174,7 @@ async def _retry_autofix(gh: GitHub, pr: dict, branch_name: str, run: dict, conf
         return
 
     next_attempt = attempt + 1
+    logger.info("Autofix %s#%d: starting attempt %d/%d", gh.repo, pr["number"], next_attempt, config.max_autofix_attempts)
     logs = await gh.workflow_logs(run["id"])
     task = (
         f"The workflow {run['name']} (run {run['id']}) is still failing after a previous automated fix "
