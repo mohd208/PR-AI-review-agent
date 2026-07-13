@@ -49,10 +49,12 @@ async def webhook(request: Request, background_tasks: BackgroundTasks, x_github_
 
     if x_github_event == "pull_request" and payload.get("action") in {"opened", "synchronize", "reopened"}:
         pr = payload["pull_request"]
-        is_bot_pr = pr.get("user", {}).get("login") == settings().bot_login
-        # Review the bot's own autofix PRs too, but only once on creation — otherwise our own
-        # fix commit fires "synchronize" and we'd re-review (and re-push) ourselves forever.
-        if not is_bot_pr or payload["action"] == "opened":
+        sender_is_bot = payload.get("sender", {}).get("login") == settings().bot_login
+        # A "synchronize" caused by our own fix commit has the bot as the event's sender,
+        # regardless of who authored the PR. Skip those, or we'd review -> push -> synchronize
+        # -> review forever. Still allow the one "opened" event when the bot creates its own
+        # autofix PR (goal 2), since sender == bot there too but it's a one-time review.
+        if not sender_is_bot or payload["action"] == "opened":
             head_repo = pr.get("head", {}).get("repo", {}).get("full_name", "")
             background_tasks.add_task(review_pr, repo, pr["number"], pr["head"]["ref"], pr["title"], head_repo)
     elif x_github_event == "workflow_run" and payload.get("action") == "completed":

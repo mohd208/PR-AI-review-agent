@@ -25,8 +25,11 @@ guardrails below) — it only edits files and pushes commits for a human to merg
   fork without "Allow edits from maintainers," the push will fail — the agent still posts a
   comment explaining that instead of failing silently.
 - Posts one PR comment: whether it pushed a fix, plus Claude's own report.
-- The agent's own autofix PRs (see below) get exactly **one** such review pass, on creation only —
-  otherwise its own fix commit would trigger another review, which pushes again, forever.
+- Every event is checked by `sender.login` (who actually caused it), not by who authored the PR.
+  When the agent's own fix commit triggers a `synchronize` event, the sender is the bot itself, so
+  that event is skipped — otherwise the bot would review its own push, push again, and loop
+  forever, on anyone's PR. The one exception is the `opened` event for a PR the bot creates itself
+  (goal 2's autofix PR) — that one still gets a single review pass.
 
 ### 2. Post-merge pipeline autofix (`workflow_run: completed`, `conclusion: failure`)
 
@@ -56,9 +59,9 @@ guardrails below) — it only edits files and pushes commits for a human to merg
   credentials).
 - Use a GitHub App token in production. Avoid a personal token with broad access.
 - `BOT_LOGIN` must match the actual GitHub login behind `GITHUB_TOKEN` (your PAT's username, or the
-  GitHub App's bot slug). This is how the service recognizes its own autofix PRs to review them
-  exactly once — if it's wrong, the loop guard silently fails to match and the review→push→
-  re-review cycle can run indefinitely.
+  GitHub App's bot slug). This is how the service recognizes events caused by its own pushes (via
+  the webhook's `sender` field) so it doesn't review→push→re-review itself forever — on anyone's
+  PR, not just its own. Get this wrong and that loop guard silently fails to match.
 - The service refuses to start if launched as root — Claude Code itself blocks
   `--dangerously-skip-permissions` under root/sudo for security reasons, so running this as root
   would silently fail on every invocation.
