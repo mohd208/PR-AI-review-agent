@@ -1,12 +1,21 @@
 import hashlib
 import hmac
 import json
+import os
+import sys
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
 from .agent import repair_failed_run, repair_pr
 from .config import settings
 from .github import GitHub
+
+if hasattr(os, "geteuid") and os.geteuid() == 0:
+    sys.exit(
+        "Refusing to start as root: Claude Code rejects --dangerously-skip-permissions "
+        "when run as root/sudo, so every autofix would silently fail. Run this service "
+        "as a non-root user instead."
+    )
 
 app = FastAPI(title="PR AutoFix Agent")
 
