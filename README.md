@@ -33,13 +33,19 @@ Every poll cycle, for each allowlisted repo:
      the PR's own branch — it never merges, closes, or approves the PR itself.
    - The PR's new head SHA (after our own push, if any) is recorded, so the next poll doesn't
      re-scan our own commit — this is what replaces webhook loop-prevention entirely.
+   - If the PR touches `.github/workflows/*`, the agent first fetches the actual configured
+     repository secret/variable **names** (never secret values — GitHub's API never exposes those)
+     and gives Claude that list, so it can flag any `${{ secrets.X }}` / `${{ vars.Y }}` reference
+     that doesn't actually exist, fix an obvious typo of an existing name, or otherwise leave a
+     genuinely missing one flagged for a human to add.
 
 2. **Check the default branch's latest completed pipeline run.** The very first time the agent
    observes a branch, it just records that run as a baseline and does nothing else — so it never
    "fixes" some pre-existing failure that was already there before the agent started watching (or
    before your PR review even happened). From then on, whenever a *new* run appears and it failed:
    derive a branch name from the workflow (`autofix/ci-<workflow-name>`), clone the default branch,
-   ask Claude to diagnose the failure from the run's logs and fix it, push to the new branch, open
+   ask Claude to diagnose the failure from the run's logs (plus the current secrets/variables
+   inventory, since a missing one is a common root cause) and fix it, push to the new branch, open
    a PR labeled `autofix-attempt-1`.
 
 3. **Check each open `autofix/ci-*` PR's latest completed run:**
@@ -71,6 +77,11 @@ restart doesn't cause every open PR to be rescanned at once.
 - `MAX_CONCURRENT_REPAIRS` bounds how many `claude` subprocesses run at once, so a burst of PR
   activity doesn't overload the server.
 - Use a GitHub App token in production. Avoid a personal token with broad access.
+- Checking secrets/variables referenced in workflows needs `Secrets: Read-only` and
+  `Variables: Read-only` on `GITHUB_TOKEN` (in addition to the permissions above). Secret **names**
+  are readable this way, never values — GitHub's API doesn't expose secret values to anyone,
+  including this agent. Without these permissions, that specific check is skipped (logged, not
+  fatal) and everything else keeps working.
 - The service refuses to start if launched as root — Claude Code itself blocks
   `--dangerously-skip-permissions` under root/sudo for security reasons, so running this as root
   would silently fail on every invocation.

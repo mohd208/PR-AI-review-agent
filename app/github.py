@@ -53,6 +53,23 @@ class GitHub:
         runs = results.get("workflow_runs", [])
         return runs[0] if runs else None
 
+    async def list_secret_names(self, environment: str | None = None) -> list[str]:
+        # GitHub never exposes secret values via the API — names only, by design.
+        path = (
+            f"/repos/{self.repo}/environments/{environment}/secrets" if environment
+            else f"/repos/{self.repo}/actions/secrets"
+        )
+        result = await self.request("GET", path, params={"per_page": 100})
+        return [s["name"] for s in result.get("secrets", [])]
+
+    async def list_variables(self, environment: str | None = None) -> list[dict]:
+        path = (
+            f"/repos/{self.repo}/environments/{environment}/variables" if environment
+            else f"/repos/{self.repo}/actions/variables"
+        )
+        result = await self.request("GET", path, params={"per_page": 100})
+        return result.get("variables", [])
+
     async def find_pr_by_branch(self, branch: str) -> dict | None:
         owner = self.repo.split("/")[0]
         results = await self.request(

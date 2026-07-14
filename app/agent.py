@@ -100,6 +100,40 @@ def _labels_with(pr: dict, new_label: str) -> list[str]:
     return kept + [new_label]
 
 
+def _touches_workflows(files: list[dict]) -> bool:
+    return any(f["filename"].startswith(".github/workflows/") for f in files)
+
+
+async def _actions_inventory(gh: GitHub) -> str:
+    """What secrets/variables actually exist, so Claude can check workflow references against
+    reality instead of just assuming a referenced name is valid."""
+    try:
+        secrets = await gh.list_secret_names()
+        secret_line = ", ".join(sorted(secrets)) if secrets else "(none configured)"
+    except Exception as exc:
+        secret_line = f"(could not list — {exc})"
+    try:
+        variables = await gh.list_variables()
+        variable_line = ", ".join(f"{v['name']}={v['value']}" for v in variables) if variables else "(none configured)"
+    except Exception as exc:
+        variable_line = f"(could not list — {exc})"
+    return (
+        "Repository-level Actions secrets currently configured (names only — GitHub never exposes "
+        f"secret values): {secret_line}\n"
+        f"Repository-level Actions variables currently configured (name=value): {variable_line}\n"
+        "For every `${{ secrets.X }}` or `${{ vars.Y }}` reference in workflow files you touch, "
+        "confirm X/Y is in the lists above, is a GitHub-provided default (e.g. "
+        "`secrets.GITHUB_TOKEN`), or is an `env`/`github` context value defined elsewhere in the "
+        "workflow. If a `jobs.<id>.environment:` is set, also check that environment's own "
+        "secrets/variables with `gh api repos/<owner>/<repo>/environments/<env>/secrets` and "
+        "`.../variables`. If a reference looks like a typo of a name that does exist, fix the "
+        "reference. If a referenced secret or variable genuinely doesn't exist anywhere, do not "
+        "invent a value for it — flag it clearly in your report as something a human needs to add "
+        "in Settings -> Secrets and variables, without treating that alone as blocking other safe "
+        "fixes in the same review."
+    )
+
+
 async def invoke_claude(directory: Path, task: str, config: Settings) -> str:
     prompt = f"{SYSTEM_RULES}\n\nTask:\n{task}"
     logger.info("Invoking Claude Code in %s (timeout=%ds)", directory, config.claude_timeout_seconds)
@@ -161,6 +195,8 @@ async def repair_pr(
     gh = GitHub(config.github_token, repo)
     changed = "\n".join(f"- {item['filename']} ({item['status']})" for item in files[:100])
     task = f"Review pull request #{number}: {title}\nChanged files:\n{changed}\nFind and safely fix actual defects in this PR."
+    if _touches_workflows(files):
+        task += f"\n\n{await _actions_inventory(gh)}"
     await gh.comment(number, "🔍 **PR AutoFix Agent**\n\nScanning this PR for issues...")
     async with lock_for(f"{repo}:{branch}"):
         pushed, result = await _apply_fix(
@@ -173,7 +209,11 @@ async def create_autofix_pr(gh: GitHub, branch_name: str, run: dict, config: Set
     base_branch = run["head_branch"]
     logger.info("Creating autofix PR for %s on %s (branch=%s)", run["name"], gh.repo, branch_name)
     logs = await gh.workflow_logs(run["id"])
-    task = f"A post-merge workflow failed: {run['name']} (run {run['id']}).\nFailed logs:\n{logs}\nDiagnose and safely fix the root cause."
+    inventory = await _actions_inventory(gh)
+    task = (
+        f"A post-merge workflow failed: {run['name']} (run {run['id']}).\nFailed logs:\n{logs}\n\n"
+        f"{inventory}\n\nDiagnose and safely fix the root cause."
+    )
     pushed, result = await _apply_fix(
         gh, base_branch, task, f"fix(ci): repair failed workflow {run['name']}", config, push_branch=branch_name
     )
@@ -199,11 +239,12 @@ async def _diagnose_exhausted(gh: GitHub, branch_name: str, run: dict, config: S
         try:
             await asyncio.to_thread(gh.clone_branch, branch_name, directory)
             logs = await gh.workflow_logs(run["id"])
+            inventory = await _actions_inventory(gh)
             task = (
                 f"The workflow {run['name']} is still failing after {config.max_autofix_attempts} automated fix "
                 "attempts on this branch, and no further automatic attempts will be made. Do NOT make any changes. "
                 "Instead, give a clear root-cause diagnosis and concrete, actionable suggestions for a human "
-                f"engineer to resolve it.\nFailed logs:\n{logs}"
+                f"engineer to resolve it.\nFailed logs:\n{logs}\n\n{inventory}"
             )
             return await invoke_claude(directory, task, config)
         except CloneFailed as exc:
@@ -235,10 +276,11 @@ async def retry_autofix(gh: GitHub, pr: dict, branch_name: str, run: dict, confi
         f"{next_attempt}/{config.max_autofix_attempts}...",
     )
     logs = await gh.workflow_logs(run["id"])
+    inventory = await _actions_inventory(gh)
     task = (
         f"The workflow {run['name']} (run {run['id']}) is still failing after a previous automated fix "
         f"attempt on this branch (attempt {next_attempt} of {config.max_autofix_attempts}).\n"
-        f"Failed logs:\n{logs}\nDiagnose and safely fix the root cause."
+        f"Failed logs:\n{logs}\n\n{inventory}\n\nDiagnose and safely fix the root cause."
     )
     pushed, result = await _apply_fix(gh, branch_name, task, f"fix(ci): retry {next_attempt} for {run['name']}", config)
     await gh.set_labels(pr["number"], _labels_with(pr, f"autofix-attempt-{next_attempt}"))
