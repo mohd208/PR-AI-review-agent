@@ -50,14 +50,15 @@ async def poll_repo(repo: str, config: Settings, state: State) -> None:
 
 
 async def _scan_pr(gh: GitHub, repo: str, pr: dict, config: Settings, state: State) -> None:
+    # repair_pr acquires this same branch's lock itself around the actual clone/fix/push — don't
+    # also hold it here, or the (non-reentrant) second acquire deadlocks the task forever.
     number = pr["number"]
     branch = pr["head"]["ref"]
     head_repo = pr.get("head", {}).get("repo", {}).get("full_name", "")
-    async with lock_for(f"{repo}:{branch}"):
-        files = await gh.pr_files(number)
-        await repair_pr(repo, number, branch, pr["title"], files, config, head_repo)
-        updated = await gh.request("GET", f"/repos/{repo}/pulls/{number}")
-        state.set_pr_sha(repo, number, updated["head"]["sha"])
+    files = await gh.pr_files(number)
+    await repair_pr(repo, number, branch, pr["title"], files, config, head_repo)
+    updated = await gh.request("GET", f"/repos/{repo}/pulls/{number}")
+    state.set_pr_sha(repo, number, updated["head"]["sha"])
 
 
 async def _check_default_branch(gh: GitHub, repo: str, branch: str, config: Settings, state: State) -> None:
