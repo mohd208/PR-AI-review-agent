@@ -63,16 +63,29 @@ async def _scan_pr(gh: GitHub, repo: str, pr: dict, config: Settings, state: Sta
 
 async def _check_default_branch(gh: GitHub, repo: str, branch: str, config: Settings, state: State) -> None:
     run = await gh.latest_run(branch)
-    if not run or run.get("conclusion") != "failure":
-        return
-    if state.get_ci_run(repo, branch) == run["id"]:
+    if not run:
         return
 
-    branch_name = f"{AUTOFIX_PREFIX}{slug(run['name'])}"
-    async with lock_for(f"{repo}:{branch_name}"):
-        existing_pr = await gh.find_pr_by_branch(branch_name)
-        if not existing_pr:
-            await create_autofix_pr(gh, branch_name, run, config)
+    last_seen = state.get_ci_run(repo, branch)
+    if last_seen is None:
+        # First time watching this branch — record a baseline without reacting. Otherwise, on
+        # first startup (or a newly allowlisted repo) we'd "fix" whatever failure happened to
+        # already be sitting there, rather than only reacting to failures from this point on.
+        state.set_ci_run(repo, branch, run["id"])
+        logger.info(
+            "Baseline recorded for %s@%s: run=%s conclusion=%s (not reacting to pre-existing runs)",
+            repo, branch, run["id"], run.get("conclusion"),
+        )
+        return
+    if run["id"] == last_seen:
+        return
+
+    if run.get("conclusion") == "failure":
+        branch_name = f"{AUTOFIX_PREFIX}{slug(run['name'])}"
+        async with lock_for(f"{repo}:{branch_name}"):
+            existing_pr = await gh.find_pr_by_branch(branch_name)
+            if not existing_pr:
+                await create_autofix_pr(gh, branch_name, run, config)
     state.set_ci_run(repo, branch, run["id"])
 
 

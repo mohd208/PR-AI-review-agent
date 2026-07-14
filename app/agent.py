@@ -192,16 +192,38 @@ async def create_autofix_pr(gh: GitHub, branch_name: str, run: dict, config: Set
     logger.info("Autofix PR opened for %s: %s#%d", run["name"], gh.repo, pr["number"])
 
 
+async def _diagnose_exhausted(gh: GitHub, branch_name: str, run: dict, config: Settings) -> str:
+    """Read-only final pass once the retry cap is hit: no edits, just a diagnosis a human can act on."""
+    async with _semaphore(config):
+        directory = Path(tempfile.mkdtemp(prefix="pr-autofix-diag-"))
+        try:
+            await asyncio.to_thread(gh.clone_branch, branch_name, directory)
+            logs = await gh.workflow_logs(run["id"])
+            task = (
+                f"The workflow {run['name']} is still failing after {config.max_autofix_attempts} automated fix "
+                "attempts on this branch, and no further automatic attempts will be made. Do NOT make any changes. "
+                "Instead, give a clear root-cause diagnosis and concrete, actionable suggestions for a human "
+                f"engineer to resolve it.\nFailed logs:\n{logs}"
+            )
+            return await invoke_claude(directory, task, config)
+        except CloneFailed as exc:
+            return f"Could not clone branch `{branch_name}` for a final diagnosis: {exc}"
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+
+
 async def retry_autofix(gh: GitHub, pr: dict, branch_name: str, run: dict, config: Settings) -> None:
     attempt = _attempt_number(pr)
     if attempt >= config.max_autofix_attempts:
         logger.info("Autofix %s#%d: attempt cap (%d) reached, not retrying", gh.repo, pr["number"], config.max_autofix_attempts)
         if not any(label["name"] == "autofix-exhausted" for label in pr.get("labels", [])):
             await gh.set_labels(pr["number"], _labels_with(pr, "autofix-exhausted"))
+            diagnosis = await _diagnose_exhausted(gh, branch_name, run, config)
             await gh.comment(
                 pr["number"],
-                f"🤖 **PR AutoFix Agent**\n\nStill failing after {attempt}/{config.max_autofix_attempts} "
-                "automatic fix attempts. Stopping here — this needs a human to take a look.",
+                f"🤖 **PR AutoFix Agent**\n\n🛑 Still failing after {attempt}/{config.max_autofix_attempts} "
+                "automatic fix attempts. Stopping here — this needs a human to take a look.\n\n"
+                f"<details>\n<summary>Diagnosis and suggestions</summary>\n\n{diagnosis}\n</details>",
             )
         return
 

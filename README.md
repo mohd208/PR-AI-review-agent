@@ -34,17 +34,21 @@ Every poll cycle, for each allowlisted repo:
    - The PR's new head SHA (after our own push, if any) is recorded, so the next poll doesn't
      re-scan our own commit — this is what replaces webhook loop-prevention entirely.
 
-2. **Check the default branch's latest completed pipeline run.** If it failed and hasn't been
-   handled yet: derive a branch name from the workflow (`autofix/ci-<workflow-name>`), clone the
-   default branch, ask Claude to diagnose the failure from the run's logs and fix it, push to the
-   new branch, open a PR labeled `autofix-attempt-1`.
+2. **Check the default branch's latest completed pipeline run.** The very first time the agent
+   observes a branch, it just records that run as a baseline and does nothing else — so it never
+   "fixes" some pre-existing failure that was already there before the agent started watching (or
+   before your PR review even happened). From then on, whenever a *new* run appears and it failed:
+   derive a branch name from the workflow (`autofix/ci-<workflow-name>`), clone the default branch,
+   ask Claude to diagnose the failure from the run's logs and fix it, push to the new branch, open
+   a PR labeled `autofix-attempt-1`.
 
 3. **Check each open `autofix/ci-*` PR's latest completed run:**
    - Still failing → comment `🔍 Pipeline still failing — scanning logs for attempt N/max...`,
      push another fix commit to the *same* PR, bump the `autofix-attempt-N` label.
    - Now passing → comment once that it's ready for review/merge.
-   - At `MAX_AUTOFIX_ATTEMPTS` → stop, label `autofix-exhausted`, comment asking a human to step
-     in.
+   - At `MAX_AUTOFIX_ATTEMPTS` → stop retrying, label `autofix-exhausted`, and run one final
+     read-only pass (no edits) asking Claude for a root-cause diagnosis and concrete suggestions
+     for a human to act on, included in the "needs a human" comment.
 
 Per-branch locking (in-memory) prevents two overlapping poll cycles from racing each other on the
 same branch. State (which SHAs/runs have already been handled) is persisted to `STATE_FILE` so a
