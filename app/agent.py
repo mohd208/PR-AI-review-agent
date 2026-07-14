@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 from .config import Settings
-from .github import GitHub, PushRejected
+from .github import CloneFailed, GitHub, PushRejected
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ def _format_report(pushed: bool, result: str) -> str:
     details = f"<details>\n<summary>Full report</summary>\n\n{result}\n</details>"
     match = _STATUS_RE.search(result)
     if not match:
-        heading = "✅ Pushed a focused repair commit." if pushed else "ℹ️ No safe code change was needed."
+        heading = "✅ Pushed a focused repair commit." if pushed else "⚠️ Could not complete the scan — see details below."
         return f"{heading}\n\n{details}"
 
     status, summary = match.group(1), match.group(2).strip()
@@ -128,12 +128,19 @@ async def _apply_fix(
         target_branch = push_branch or source_branch
         try:
             logger.info("Cloning %s (repo=%s) into %s", source_branch, clone_repo or gh.repo, directory)
-            gh.clone_branch(source_branch, directory, repo=clone_repo)
+            try:
+                # Runs in a worker thread — it's a blocking subprocess call, and letting it block
+                # the asyncio event loop would freeze the whole server (all repos, /healthz, etc.)
+                # for as long as git takes, including if it hangs waiting on a bad-token failure.
+                await asyncio.to_thread(gh.clone_branch, source_branch, directory, clone_repo)
+            except CloneFailed as exc:
+                logger.warning("Clone of %s failed: %s", source_branch, exc)
+                return False, f"Could not clone branch `{source_branch}`: {exc}"
             if push_branch:
                 subprocess.run(["git", "checkout", "-b", push_branch], cwd=directory, check=True)
             result = await invoke_claude(directory, task, config)
             try:
-                pushed = gh.commit_and_push(directory, target_branch, commit_message)
+                pushed = await asyncio.to_thread(gh.commit_and_push, directory, target_branch, commit_message)
                 logger.info("Push to %s: %s", target_branch, "changes pushed" if pushed else "no changes to push")
             except PushRejected as exc:
                 pushed = False
