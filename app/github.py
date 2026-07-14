@@ -26,8 +26,22 @@ class GitHub:
         response.raise_for_status()
         return response.json() if response.content else None
 
+    async def get_repo(self) -> dict:
+        return await self.request("GET", f"/repos/{self.repo}")
+
+    async def list_open_prs(self) -> list[dict]:
+        return await self.request("GET", f"/repos/{self.repo}/pulls", params={"state": "open", "per_page": 100})
+
     async def pr_files(self, number: int) -> list[dict]:
         return await self.request("GET", f"/repos/{self.repo}/pulls/{number}/files", params={"per_page": 100})
+
+    async def latest_run(self, branch: str) -> dict | None:
+        results = await self.request(
+            "GET", f"/repos/{self.repo}/actions/runs",
+            params={"branch": branch, "status": "completed", "per_page": 1},
+        )
+        runs = results.get("workflow_runs", [])
+        return runs[0] if runs else None
 
     async def find_pr_by_branch(self, branch: str) -> dict | None:
         owner = self.repo.split("/")[0]

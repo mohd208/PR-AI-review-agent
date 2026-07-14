@@ -1,55 +1,56 @@
 # PR AutoFix Agent
 
-A deployable GitHub webhook service that uses your server's authenticated **Claude Code CLI** to:
+A deployable service that uses your server's authenticated **Claude Code CLI** to:
 
-1. review new or updated pull requests (including from another agent that generates GitHub
-   workflows, Terraform, or Kubernetes manifests), make safe repair edits, push them to the same
-   branch, and comment with the result;
+1. scan open pull requests (including from another agent that generates GitHub workflows,
+   Terraform, or Kubernetes manifests), make safe repair edits, push them to the same branch, and
+   comment with the result;
 2. after a merge, watch for failed post-merge pipeline runs, diagnose and fix the root cause on a
    new `autofix/ci-*` branch, and open a repair PR;
 3. if that pipeline keeps failing, keep pushing follow-up fix commits to the **same** autofix PR
    (not a new one each time) — up to `MAX_AUTOFIX_ATTEMPTS` — then stop and ask a human to take
    over instead of looping forever.
 
+**No GitHub webhook to configure.** The service polls the GitHub API directly with `GITHUB_TOKEN`
+every `POLL_INTERVAL_SECONDS` (default 60s) — just point it at your repos in `.env` and run it.
+
 The service does not merge PRs itself, and it never runs infrastructure-mutating commands (see
 guardrails below) — it only edits files and pushes commits for a human to merge.
 
-## How the two flows work
+## How it works
 
-### 1. PR review (`pull_request: opened / synchronize / reopened`)
+Every poll cycle, for each allowlisted repo:
 
-- Skips repos that aren't allowlisted.
-- Fetches the changed files, clones the PR's branch (from the fork if it's a fork), and asks
-  Claude Code to inspect the repo and make the smallest safe fix.
-- If the working tree changed, commits and pushes back to the same branch. If the branch is on a
-  fork without "Allow edits from maintainers," the push will fail — the agent still posts a
-  comment explaining that instead of failing silently.
-- Posts one PR comment: whether it pushed a fix, plus Claude's own report.
-- Every event is checked by `sender.login` (who actually caused it), not by who authored the PR.
-  When the agent's own fix commit triggers a `synchronize` event, the sender is the bot itself, so
-  that event is skipped — otherwise the bot would review its own push, push again, and loop
-  forever, on anyone's PR. The one exception is the `opened` event for a PR the bot creates itself
-  (goal 2's autofix PR) — that one still gets a single review pass.
+1. **List open PRs.** Any PR whose branch isn't an `autofix/ci-*` branch and whose head commit SHA
+   differs from the last one this agent scanned gets a repair pass:
+   - Comment: `🔍 Scanning this PR for issues...`
+   - Clone → ask Claude Code to inspect the repo and make the smallest safe fix → commit and push
+     to the same branch (works for forks too; if the push is rejected — no "Allow edits from
+     maintainers" — the next comment explains that instead of failing silently).
+   - Comment: `✅ Pushed a focused repair commit.` or `ℹ️ No safe code change was needed.`, with
+     Claude's report.
+   - The PR's new head SHA (after our own push, if any) is recorded, so the next poll doesn't
+     re-scan our own commit — this is what replaces webhook loop-prevention entirely.
 
-### 2. Post-merge pipeline autofix (`workflow_run: completed`, `conclusion: failure`)
+2. **Check the default branch's latest completed pipeline run.** If it failed and hasn't been
+   handled yet: derive a branch name from the workflow (`autofix/ci-<workflow-name>`), clone the
+   default branch, ask Claude to diagnose the failure from the run's logs and fix it, push to the
+   new branch, open a PR labeled `autofix-attempt-1`.
 
-- The branch name is derived from the workflow name (`autofix/ci-<workflow-name>`), so repeated
-  failures of the *same* workflow always map to the *same* autofix branch/PR.
-- **First failure** (triggered by a push, e.g. a normal merge to `main`): clones the base branch,
-  creates `autofix/ci-<name>`, asks Claude to diagnose the failure from the run's logs and fix it,
-  pushes, and opens a PR labeled `autofix-attempt-1`.
-- **Pipeline still failing on that PR** (another `workflow_run` failure for the same branch, from
-  either a push or the PR's own checks): pushes another fix commit to the *same* branch/PR and
-  bumps the `autofix-attempt-N` label — it does not open a second PR.
-- **Attempt cap reached** (`MAX_AUTOFIX_ATTEMPTS`, default 3): stops pushing further fixes, labels
-  the PR `autofix-exhausted`, and comments asking a human to take over.
-- Per-branch locking prevents two overlapping webhook deliveries for the same branch from racing
-  each other or double-counting an attempt.
+3. **Check each open `autofix/ci-*` PR's latest completed run:**
+   - Still failing → comment `🔍 Pipeline still failing — scanning logs for attempt N/max...`,
+     push another fix commit to the *same* PR, bump the `autofix-attempt-N` label.
+   - Now passing → comment once that it's ready for review/merge.
+   - At `MAX_AUTOFIX_ATTEMPTS` → stop, label `autofix-exhausted`, comment asking a human to step
+     in.
+
+Per-branch locking (in-memory) prevents two overlapping poll cycles from racing each other on the
+same branch. State (which SHAs/runs have already been handled) is persisted to `STATE_FILE` so a
+restart doesn't cause every open PR to be rescanned at once.
 
 ## Guardrails
 
 - Allowlisted repositories only (`ALLOWED_REPOSITORIES`).
-- Signed GitHub webhooks only.
 - Claude is explicitly instructed to never run infrastructure-mutating commands (`terraform
   apply`/`destroy`, `kubectl apply`/`delete`, cloud CLI mutations) — only read-only/plan/validate
   commands (`terraform validate`, `terraform plan`, `kubeval`, `kubectl --dry-run`, etc.). It also
@@ -57,11 +58,9 @@ guardrails below) — it only edits files and pushes commits for a human to merg
 - Capped autofix attempts (`MAX_AUTOFIX_ATTEMPTS`) stop a broken pipeline from being retried
   forever if the root cause isn't something Claude can actually fix (e.g. an outage or missing
   credentials).
+- `MAX_CONCURRENT_REPAIRS` bounds how many `claude` subprocesses run at once, so a burst of PR
+  activity doesn't overload the server.
 - Use a GitHub App token in production. Avoid a personal token with broad access.
-- `BOT_LOGIN` must match the actual GitHub login behind `GITHUB_TOKEN` (your PAT's username, or the
-  GitHub App's bot slug). This is how the service recognizes events caused by its own pushes (via
-  the webhook's `sender` field) so it doesn't review→push→re-review itself forever — on anyone's
-  PR, not just its own. Get this wrong and that loop guard silently fails to match.
 - The service refuses to start if launched as root — Claude Code itself blocks
   `--dangerously-skip-permissions` under root/sudo for security reasons, so running this as root
   would silently fail on every invocation.
@@ -84,7 +83,7 @@ python -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# edit .env with your token, webhook secret, and owner/repository
+# edit .env with your token and owner/repository — no webhook secret needed anymore
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
@@ -92,21 +91,15 @@ The `CLAUDE_COMMAND` account must be logged in with your Claude subscription/API
 same OS user that runs uvicorn — credentials are stored per-user, so logging in as a different
 user (e.g. root) won't carry over. The service uses `claude -p` to invoke it non-interactively.
 
-## GitHub configuration
-
-Create a webhook in the target repository:
-
-- Payload URL: `https://YOUR-SERVER/webhooks/github`
-- Content type: `application/json`
-- Secret: the same `GITHUB_WEBHOOK_SECRET`
-- Events: **Pull requests** and **Workflow runs**
-
-For public internet exposure, put the service behind HTTPS (for example Caddy or Nginx). GitHub
-requires a reachable HTTPS webhook endpoint.
+`/healthz` is available for monitoring, but there's no `/webhooks/github` endpoint anymore —
+everything is driven by polling.
 
 ## Operational notes
 
-`workflow_run` handling only creates a *new* autofix PR for failures triggered by `push` (the
-normal post-merge case) — it won't open a PR for a failing check on an unrelated contributor's PR
-(that's handled by the PR review flow instead). Before enabling this in a production repository,
-add branch protection and review the GitHub App permissions.
+Pipeline autofix only creates a *new* PR from the default branch's own runs; failures on an
+unrelated contributor's PR checks are left to the PR-review flow instead. Before enabling this in
+a production repository, add branch protection and review the GitHub App/token permissions.
+
+Polling cost scales with the number of allowlisted repos and open PRs — each cycle calls the
+GitHub API a handful of times per repo. At the default 60s interval this is well within GitHub's
+rate limits for a normal number of repos.

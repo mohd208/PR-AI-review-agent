@@ -1,2 +1,2 @@
-"""GitHub webhook driven Claude Code repair agent."""
+"""GitHub-polling Claude Code repair agent."""
 

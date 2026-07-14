@@ -30,16 +30,26 @@ Hard rules:
 When finished, return a short summary of changed files and validation performed. If no safe fix
 exists, do not edit any files and explain why."""
 
-# Serializes repairs per branch so two webhook events for the same branch can't race each
-# other's clone/commit/push or double-count a retry attempt.
+# Serializes repairs per branch so two overlapping poll cycles can't race each other's
+# clone/commit/push or double-count a retry attempt.
 _branch_locks: dict[str, asyncio.Lock] = {}
 
+# Caps how many `claude` subprocesses run at once, since each is a real, resource-heavy process.
+_repair_semaphore: asyncio.Semaphore | None = None
 
-def _lock_for(key: str) -> asyncio.Lock:
+
+def lock_for(key: str) -> asyncio.Lock:
     return _branch_locks.setdefault(key, asyncio.Lock())
 
 
-def _slug(text: str) -> str:
+def _semaphore(config: Settings) -> asyncio.Semaphore:
+    global _repair_semaphore
+    if _repair_semaphore is None:
+        _repair_semaphore = asyncio.Semaphore(config.max_concurrent_repairs)
+    return _repair_semaphore
+
+
+def slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40] or "workflow"
 
 
@@ -82,27 +92,28 @@ async def _apply_fix(
     gh: GitHub, source_branch: str, task: str, commit_message: str, config: Settings,
     push_branch: str | None = None, clone_repo: str | None = None,
 ) -> tuple[bool, str]:
-    directory = Path(tempfile.mkdtemp(prefix="pr-autofix-"))
-    target_branch = push_branch or source_branch
-    try:
-        logger.info("Cloning %s (repo=%s) into %s", source_branch, clone_repo or gh.repo, directory)
-        gh.clone_branch(source_branch, directory, repo=clone_repo)
-        if push_branch:
-            subprocess.run(["git", "checkout", "-b", push_branch], cwd=directory, check=True)
-        result = await invoke_claude(directory, task, config)
+    async with _semaphore(config):
+        directory = Path(tempfile.mkdtemp(prefix="pr-autofix-"))
+        target_branch = push_branch or source_branch
         try:
-            pushed = gh.commit_and_push(directory, target_branch, commit_message)
-            logger.info("Push to %s: %s", target_branch, "changes pushed" if pushed else "no changes to push")
-        except PushRejected as exc:
-            pushed = False
-            logger.warning("Push to %s rejected: %s", target_branch, exc)
-            result += (
-                f"\n\n(A fix was computed but could not be pushed: {exc}\n"
-                "This usually means the branch is on a fork without \"Allow edits from maintainers\" enabled.)"
-            )
-        return pushed, result
-    finally:
-        shutil.rmtree(directory, ignore_errors=True)
+            logger.info("Cloning %s (repo=%s) into %s", source_branch, clone_repo or gh.repo, directory)
+            gh.clone_branch(source_branch, directory, repo=clone_repo)
+            if push_branch:
+                subprocess.run(["git", "checkout", "-b", push_branch], cwd=directory, check=True)
+            result = await invoke_claude(directory, task, config)
+            try:
+                pushed = gh.commit_and_push(directory, target_branch, commit_message)
+                logger.info("Push to %s: %s", target_branch, "changes pushed" if pushed else "no changes to push")
+            except PushRejected as exc:
+                pushed = False
+                logger.warning("Push to %s rejected: %s", target_branch, exc)
+                result += (
+                    f"\n\n(A fix was computed but could not be pushed: {exc}\n"
+                    "This usually means the branch is on a fork without \"Allow edits from maintainers\" enabled.)"
+                )
+            return pushed, result
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
 
 
 async def repair_pr(
@@ -112,34 +123,18 @@ async def repair_pr(
     gh = GitHub(config.github_token, repo)
     changed = "\n".join(f"- {item['filename']} ({item['status']})" for item in files[:100])
     task = f"Review pull request #{number}: {title}\nChanged files:\n{changed}\nFind and safely fix actual defects in this PR."
-    async with _lock_for(f"{repo}:{branch}"):
+    await gh.comment(number, "🔍 **PR AutoFix Agent**\n\nScanning this PR for issues...")
+    async with lock_for(f"{repo}:{branch}"):
         pushed, result = await _apply_fix(
             gh, branch, task, f"fix: address automated review for PR #{number}", config, clone_repo=head_repo
         )
-    status = "I pushed a focused repair commit." if pushed else "I found no safe code change to push."
+    status = "✅ Pushed a focused repair commit." if pushed else "ℹ️ No safe code change was needed."
     await gh.comment(number, f"🤖 **PR AutoFix Agent**\n\n{status}\n\nClaude report:\n```text\n{result}\n```")
 
 
-async def handle_workflow_failure(repo: str, run: dict, config: Settings) -> None:
-    gh = GitHub(config.github_token, repo)
-    branch_name = f"autofix/ci-{_slug(run['name'])}"
-    async with _lock_for(f"{repo}:{branch_name}"):
-        existing_pr = await gh.find_pr_by_branch(branch_name)
-        if existing_pr:
-            logger.info("Workflow failure: retry path for %s#%d (branch=%s)", repo, existing_pr["number"], branch_name)
-            await _retry_autofix(gh, existing_pr, branch_name, run, config)
-        elif run.get("event") == "push":
-            logger.info("Workflow failure: creating autofix PR on %s (branch=%s)", repo, branch_name)
-            await _create_autofix_pr(gh, branch_name, run, config)
-        else:
-            logger.info(
-                "Workflow failure: no existing autofix PR and event=%s (not push) for %s, ignoring",
-                run.get("event"), repo,
-            )
-
-
-async def _create_autofix_pr(gh: GitHub, branch_name: str, run: dict, config: Settings) -> None:
+async def create_autofix_pr(gh: GitHub, branch_name: str, run: dict, config: Settings) -> None:
     base_branch = run["head_branch"]
+    logger.info("Creating autofix PR for %s on %s (branch=%s)", run["name"], gh.repo, branch_name)
     logs = await gh.workflow_logs(run["id"])
     task = f"A post-merge workflow failed: {run['name']} (run {run['id']}).\nFailed logs:\n{logs}\nDiagnose and safely fix the root cause."
     pushed, result = await _apply_fix(
@@ -160,7 +155,7 @@ async def _create_autofix_pr(gh: GitHub, branch_name: str, run: dict, config: Se
     logger.info("Autofix PR opened for %s: %s#%d", run["name"], gh.repo, pr["number"])
 
 
-async def _retry_autofix(gh: GitHub, pr: dict, branch_name: str, run: dict, config: Settings) -> None:
+async def retry_autofix(gh: GitHub, pr: dict, branch_name: str, run: dict, config: Settings) -> None:
     attempt = _attempt_number(pr)
     if attempt >= config.max_autofix_attempts:
         logger.info("Autofix %s#%d: attempt cap (%d) reached, not retrying", gh.repo, pr["number"], config.max_autofix_attempts)
@@ -175,6 +170,11 @@ async def _retry_autofix(gh: GitHub, pr: dict, branch_name: str, run: dict, conf
 
     next_attempt = attempt + 1
     logger.info("Autofix %s#%d: starting attempt %d/%d", gh.repo, pr["number"], next_attempt, config.max_autofix_attempts)
+    await gh.comment(
+        pr["number"],
+        f"🔍 **PR AutoFix Agent**\n\nPipeline still failing — scanning logs for attempt "
+        f"{next_attempt}/{config.max_autofix_attempts}...",
+    )
     logs = await gh.workflow_logs(run["id"])
     task = (
         f"The workflow {run['name']} (run {run['id']}) is still failing after a previous automated fix "
@@ -184,7 +184,7 @@ async def _retry_autofix(gh: GitHub, pr: dict, branch_name: str, run: dict, conf
     pushed, result = await _apply_fix(gh, branch_name, task, f"fix(ci): retry {next_attempt} for {run['name']}", config)
     await gh.set_labels(pr["number"], _labels_with(pr, f"autofix-attempt-{next_attempt}"))
     status = (
-        f"Pushed fix attempt {next_attempt}/{config.max_autofix_attempts}." if pushed
-        else f"Found no safe change to push (attempt {next_attempt}/{config.max_autofix_attempts})."
+        f"✅ Pushed fix attempt {next_attempt}/{config.max_autofix_attempts}." if pushed
+        else f"ℹ️ Found no safe change to push (attempt {next_attempt}/{config.max_autofix_attempts})."
     )
     await gh.comment(pr["number"], f"🤖 **PR AutoFix Agent**\n\n{status}\n\nClaude report:\n```text\n{result}\n```")
