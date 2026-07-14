@@ -86,11 +86,18 @@ class GitHub:
     async def workflow_logs(self, run_id: int) -> str:
         logger.info("Fetching failed-job logs for run %s (%s)", run_id, self.repo)
         # GitHub redirects this endpoint to a ZIP archive. gh handles the download reliably.
-        result = subprocess.run(
-            ["gh", "run", "view", str(run_id), "--repo", self.repo, "--log-failed"],
-            capture_output=True, text=True, timeout=120, check=False,
-            env={**_GIT_ENV, "GH_TOKEN": self.headers["Authorization"].split(" ", 1)[1]},
-        )
+        try:
+            result = subprocess.run(
+                ["gh", "run", "view", str(run_id), "--repo", self.repo, "--log-failed"],
+                capture_output=True, text=True, timeout=120, check=False,
+                env={**_GIT_ENV, "GH_TOKEN": self.headers["Authorization"].split(" ", 1)[1]},
+            )
+        except OSError as exc:
+            logger.error("Could not run 'gh' to fetch logs for run %s: %s", run_id, exc)
+            return (
+                "(Could not fetch failed-job logs: the `gh` CLI is not installed/available on this "
+                f"server — {exc}. Install and authenticate GitHub CLI, then this will work.)"
+            )
         if result.returncode != 0:
             logger.warning("gh run view failed for run %s: %s", run_id, result.stderr.strip()[-500:])
         return (result.stdout + "\n" + result.stderr)[-50000:]
