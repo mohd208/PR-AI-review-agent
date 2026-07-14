@@ -15,20 +15,51 @@ logger = logging.getLogger(__name__)
 SYSTEM_RULES = """You are a careful repository repair agent working non-interactively. Work only
 on the stated issue and make the smallest correct fix.
 
+The codebase may be in any programming language or file format: application code in any language,
+Dockerfiles, GitHub Actions workflows (.github/workflows/*.yml), Terraform (*.tf), Kubernetes
+manifests (*.yaml/*.yml), or anything else. Use whatever validation fits the files you touched —
+the project's own build/test/lint commands if present, plus format-specific tools where relevant
+and available (e.g. `node --check`, `python -m py_compile`/pytest, `go build`/`go vet`,
+`terraform validate`/`terraform fmt -check`, `kubeval`/`kubectl --dry-run=client`, `hadolint`,
+`actionlint`, `yamllint`).
+
 Hard rules:
 - Never modify credentials, secrets, lockfiles (unless the task is literally a lockfile fix), CI
   permissions, or branch-protection configuration.
 - Never disable, skip, or weaken tests or checks to make them pass.
 - Never run destructive or "apply" commands: no `terraform apply`, `terraform destroy`,
   `kubectl apply`, `kubectl delete`, cloud CLI mutations, or anything that changes real
-  infrastructure or deployed state. You may run read-only/plan/validate/lint commands
-  (`terraform validate`, `terraform fmt -check`, `terraform plan`, `kubeval`,
-  `kubectl --dry-run=client`, `yamllint`, `actionlint`, etc.).
+  infrastructure or deployed state. You may run read-only/plan/validate/lint commands.
+- Never merge, close, approve, or otherwise change the state of any pull request, and never run
+  `gh pr merge`, `gh pr close`, `gh pr review`, or any repository-administration command. Your only
+  job is editing files in the working tree — a human always decides whether and when to merge.
 - Only edit files in the working tree; never touch state files, kubeconfig, or cloud credentials.
-- Run the most relevant available validation for the files you changed.
 
-When finished, return a short summary of changed files and validation performed. If no safe fix
+The first line of your final report must be exactly one of:
+`STATUS: OK - <one short sentence>` if the code is already correct and you made no changes, or
+`STATUS: FIXED - <one short sentence describing the issue and the fix>` if you made changes.
+Follow that line with a short summary of changed files and validation performed. If no safe fix
 exists, do not edit any files and explain why."""
+
+_STATUS_RE = re.compile(r"^STATUS:\s*(OK|FIXED)\s*-\s*(.+)$", re.MULTILINE)
+
+
+def _format_report(pushed: bool, result: str) -> str:
+    details = f"<details>\n<summary>Full report</summary>\n\n{result}\n</details>"
+    match = _STATUS_RE.search(result)
+    if not match:
+        heading = "✅ Pushed a focused repair commit." if pushed else "ℹ️ No safe code change was needed."
+        return f"{heading}\n\n{details}"
+
+    status, summary = match.group(1), match.group(2).strip()
+    if status == "OK":
+        heading = f"✅ Everything is good — {summary}"
+    elif pushed:
+        heading = f"🔧 Found an issue: {summary} Fixed and pushed."
+    else:
+        heading = f"⚠️ Found an issue: {summary} Could not push the fix — see details below."
+    return f"{heading}\n\n{details}"
+
 
 # Serializes repairs per branch so two overlapping poll cycles can't race each other's
 # clone/commit/push or double-count a retry attempt.
@@ -128,8 +159,7 @@ async def repair_pr(
         pushed, result = await _apply_fix(
             gh, branch, task, f"fix: address automated review for PR #{number}", config, clone_repo=head_repo
         )
-    status = "✅ Pushed a focused repair commit." if pushed else "ℹ️ No safe code change was needed."
-    await gh.comment(number, f"🤖 **PR AutoFix Agent**\n\n{status}\n\nClaude report:\n```text\n{result}\n```")
+    await gh.comment(number, f"🤖 **PR AutoFix Agent**\n\n{_format_report(pushed, result)}")
 
 
 async def create_autofix_pr(gh: GitHub, branch_name: str, run: dict, config: Settings) -> None:
@@ -145,7 +175,7 @@ async def create_autofix_pr(gh: GitHub, branch_name: str, run: dict, config: Set
         return
     pr = await gh.create_pr(
         branch_name, base_branch, f"fix(ci): repair {run['name']}",
-        f"Automated repair for failed workflow.\n\nClaude report:\n```text\n{result}\n```",
+        f"Automated repair for failed workflow.\n\n{_format_report(pushed, result)}",
     )
     await gh.set_labels(pr["number"], ["autofix-attempt-1"])
     await gh.comment(
@@ -183,8 +213,7 @@ async def retry_autofix(gh: GitHub, pr: dict, branch_name: str, run: dict, confi
     )
     pushed, result = await _apply_fix(gh, branch_name, task, f"fix(ci): retry {next_attempt} for {run['name']}", config)
     await gh.set_labels(pr["number"], _labels_with(pr, f"autofix-attempt-{next_attempt}"))
-    status = (
-        f"✅ Pushed fix attempt {next_attempt}/{config.max_autofix_attempts}." if pushed
-        else f"ℹ️ Found no safe change to push (attempt {next_attempt}/{config.max_autofix_attempts})."
+    await gh.comment(
+        pr["number"],
+        f"🤖 **PR AutoFix Agent** (attempt {next_attempt}/{config.max_autofix_attempts})\n\n{_format_report(pushed, result)}",
     )
-    await gh.comment(pr["number"], f"🤖 **PR AutoFix Agent**\n\n{status}\n\nClaude report:\n```text\n{result}\n```")

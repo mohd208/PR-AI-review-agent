@@ -27,8 +27,10 @@ Every poll cycle, for each allowlisted repo:
    - Clone → ask Claude Code to inspect the repo and make the smallest safe fix → commit and push
      to the same branch (works for forks too; if the push is rejected — no "Allow edits from
      maintainers" — the next comment explains that instead of failing silently).
-   - Comment: `✅ Pushed a focused repair commit.` or `ℹ️ No safe code change was needed.`, with
-     Claude's report.
+   - One follow-up comment with the outcome: `✅ Everything is good — <reason>` if nothing was
+     wrong, or `🔧 Found an issue: <summary> Fixed and pushed.` if it made a change (full Claude
+     output is included collapsed underneath either way). The agent only ever pushes commits to
+     the PR's own branch — it never merges, closes, or approves the PR itself.
    - The PR's new head SHA (after our own push, if any) is recorded, so the next poll doesn't
      re-scan our own commit — this is what replaces webhook loop-prevention entirely.
 
@@ -55,6 +57,10 @@ restart doesn't cause every open PR to be rescanned at once.
   apply`/`destroy`, `kubectl apply`/`delete`, cloud CLI mutations) — only read-only/plan/validate
   commands (`terraform validate`, `terraform plan`, `kubeval`, `kubectl --dry-run`, etc.). It also
   must not touch credentials, secrets, state files, or CI/branch-protection config.
+- Claude is explicitly instructed to never merge, close, approve, or run any `gh pr` administration
+  command — its only capability is editing files in the cloned working tree. This is stated as a
+  hard rule in the prompt (not just assumed from what our own code calls), since the server's `gh`
+  CLI is authenticated and could otherwise be invoked directly.
 - Capped autofix attempts (`MAX_AUTOFIX_ATTEMPTS`) stop a broken pipeline from being retried
   forever if the root cause isn't something Claude can actually fix (e.g. an outage or missing
   credentials).
