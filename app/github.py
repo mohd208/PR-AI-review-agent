@@ -53,6 +53,15 @@ class GitHub:
         runs = results.get("workflow_runs", [])
         return runs[0] if runs else None
 
+    async def runs_for_sha(self, sha: str) -> list[dict]:
+        # head_sha works regardless of whether the branch lives in this repo or a fork, unlike
+        # the branch filter above.
+        results = await self.request(
+            "GET", f"/repos/{self.repo}/actions/runs",
+            params={"head_sha": sha, "status": "completed", "per_page": 20},
+        )
+        return results.get("workflow_runs", [])
+
     async def list_secret_names(self, environment: str | None = None) -> list[str]:
         # GitHub never exposes secret values via the API — names only, by design.
         path = (

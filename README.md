@@ -5,11 +5,13 @@ A deployable service that uses your server's authenticated **Claude Code CLI** t
 1. scan open pull requests (including from another agent that generates GitHub workflows,
    Terraform, or Kubernetes manifests), make safe repair edits, push them to the same branch, and
    comment with the result;
-2. after a merge, watch for failed post-merge pipeline runs, diagnose and fix the root cause on a
+2. also check the CI checks triggered by that same PR — if any of them fail, diagnose the actual
+   failure logs and push a fix to the same PR branch, not just review the diff statically;
+3. after a merge, watch for failed post-merge pipeline runs, diagnose and fix the root cause on a
    new `autofix/ci-*` branch, and open a repair PR;
-3. if that pipeline keeps failing, keep pushing follow-up fix commits to the **same** autofix PR
-   (not a new one each time) — up to `MAX_AUTOFIX_ATTEMPTS` — then stop and ask a human to take
-   over instead of looping forever.
+4. if a pipeline keeps failing (either on a regular PR or an autofix PR), keep pushing follow-up
+   fix commits to the **same** PR (not a new one each time) — up to `MAX_AUTOFIX_ATTEMPTS` — then
+   stop and give a human a concrete diagnosis instead of looping forever.
 
 **No GitHub webhook to configure.** The service polls the GitHub API directly with `GITHUB_TOKEN`
 every `POLL_INTERVAL_SECONDS` (default 60s) — just point it at your repos in `.env` and run it.
@@ -21,23 +23,29 @@ guardrails below) — it only edits files and pushes commits for a human to merg
 
 Every poll cycle, for each allowlisted repo:
 
-1. **List open PRs.** Any PR whose branch isn't an `autofix/ci-*` branch and whose head commit SHA
-   differs from the last one this agent scanned gets a repair pass:
-   - Comment: `🔍 Scanning this PR for issues...`
-   - Clone → ask Claude Code to inspect the repo and make the smallest safe fix → commit and push
-     to the same branch (works for forks too; if the push is rejected — no "Allow edits from
-     maintainers" — the next comment explains that instead of failing silently).
-   - One follow-up comment with the outcome: `✅ Everything is good — <reason>` if nothing was
-     wrong, or `🔧 Found an issue: <summary> Fixed and pushed.` if it made a change (full Claude
-     output is included collapsed underneath either way). The agent only ever pushes commits to
+1. **List open PRs.** For every PR that isn't on an `autofix/ci-*` branch, the agent checks two
+   independent things and reacts to whichever changed since it last looked:
+   - **The diff itself** — if the head commit SHA is new, comment `🔍 Scanning this PR for
+     issues...`, clone → ask Claude Code to inspect the repo and make the smallest safe fix →
+     commit and push to the same branch (works for forks too; if the push is rejected — no "Allow
+     edits from maintainers" — the next comment explains that instead of failing silently). If the
+     PR touches `.github/workflows/*`, Claude is also given the actual configured repository
+     secret/variable **names** (never secret values — GitHub's API never exposes those) so it can
+     flag any `${{ secrets.X }}` / `${{ vars.Y }}` reference that doesn't actually exist, fix an
+     obvious typo of an existing name, or leave a genuinely missing one flagged for a human to add.
+   - **The PR's own CI checks** — checked every cycle regardless of whether the diff changed, since
+     CI often finishes well after the commit that triggered it was already reviewed. If a check run
+     for the current head commit fails and hasn't been handled yet, the agent feeds Claude the
+     actual failure logs (not just the diff) and pushes a targeted fix to the same branch — capped
+     at `MAX_AUTOFIX_ATTEMPTS` the same way the post-merge flow below is, using the same
+     `autofix-attempt-N`/`autofix-exhausted` labels and a final read-only diagnosis once exhausted.
+   - Either way, one follow-up comment with the outcome: `✅ Everything is good — <reason>` if
+     nothing was wrong, or `🔧 Found an issue: <summary> Fixed and pushed.` if it made a change
+     (full Claude output collapsed underneath either way). The agent only ever pushes commits to
      the PR's own branch — it never merges, closes, or approves the PR itself.
-   - The PR's new head SHA (after our own push, if any) is recorded, so the next poll doesn't
-     re-scan our own commit — this is what replaces webhook loop-prevention entirely.
-   - If the PR touches `.github/workflows/*`, the agent first fetches the actual configured
-     repository secret/variable **names** (never secret values — GitHub's API never exposes those)
-     and gives Claude that list, so it can flag any `${{ secrets.X }}` / `${{ vars.Y }}` reference
-     that doesn't actually exist, fix an obvious typo of an existing name, or otherwise leave a
-     genuinely missing one flagged for a human to add.
+   - The PR's new head SHA (after our own push, if any) and the last-handled CI run ID are both
+     recorded, so the next poll doesn't re-react to our own commit or the same already-seen run —
+     this is what replaces webhook loop-prevention entirely.
 
 2. **Check the default branch's latest completed pipeline run.** The very first time the agent
    observes a branch, it just records that run as a baseline and does nothing else — so it never

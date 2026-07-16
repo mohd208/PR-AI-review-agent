@@ -1,7 +1,7 @@
 import asyncio
 import logging
 
-from .agent import create_autofix_pr, lock_for, repair_pr, retry_autofix, slug
+from .agent import create_autofix_pr, lock_for, repair_pr, repair_pr_ci_failure, retry_autofix, slug
 from .config import Settings
 from .github import GitHub
 from .state import State
@@ -35,8 +35,7 @@ async def poll_repo(repo: str, config: Settings, state: State) -> None:
             # otherwise a single fix commit would trigger two independent Claude passes on it.
             autofix_prs.append(pr)
             continue
-        if state.get_pr_sha(repo, pr["number"]) != pr["head"]["sha"]:
-            tasks.append(_scan_pr(gh, repo, pr, config, state))
+        tasks.append(_scan_pr(gh, repo, pr, config, state))
 
     repo_info = await gh.get_repo()
     tasks.append(_check_default_branch(gh, repo, repo_info["default_branch"], config, state))
@@ -49,14 +48,36 @@ async def poll_repo(repo: str, config: Settings, state: State) -> None:
             logger.error("Poll task for %s raised", repo, exc_info=result)
 
 
+async def _latest_failed_run_for_sha(gh: GitHub, sha: str) -> dict | None:
+    runs = await gh.runs_for_sha(sha)
+    return next((r for r in runs if r.get("conclusion") == "failure"), None)
+
+
 async def _scan_pr(gh: GitHub, repo: str, pr: dict, config: Settings, state: State) -> None:
-    # repair_pr acquires this same branch's lock itself around the actual clone/fix/push — don't
-    # also hold it here, or the (non-reentrant) second acquire deadlocks the task forever.
+    # repair_pr/repair_pr_ci_failure acquire this same branch's lock themselves around the actual
+    # clone/fix/push — don't also hold it here, or the (non-reentrant) second acquire deadlocks
+    # the task forever.
     number = pr["number"]
     branch = pr["head"]["ref"]
+    sha = pr["head"]["sha"]
     head_repo = pr.get("head", {}).get("repo", {}).get("full_name", "")
+
+    sha_changed = state.get_pr_sha(repo, number) != sha
+    # Checked every cycle regardless of sha_changed, since a PR's CI often finishes well after
+    # the commit that triggered it was already reviewed.
+    ci_failure = await _latest_failed_run_for_sha(gh, sha)
+    ci_is_new = ci_failure is not None and state.get_ci_run(repo, branch) != ci_failure["id"]
+
+    if not sha_changed and not ci_is_new:
+        return
+
     files = await gh.pr_files(number)
-    await repair_pr(repo, number, branch, pr["title"], files, config, head_repo)
+    if ci_is_new:
+        await repair_pr_ci_failure(repo, pr, files, config, head_repo, ci_failure)
+        state.set_ci_run(repo, branch, ci_failure["id"])
+    else:
+        await repair_pr(repo, number, branch, pr["title"], files, config, head_repo)
+
     updated = await gh.request("GET", f"/repos/{repo}/pulls/{number}")
     state.set_pr_sha(repo, number, updated["head"]["sha"])
 

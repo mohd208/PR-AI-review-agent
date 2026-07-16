@@ -205,6 +205,59 @@ async def repair_pr(
     await gh.comment(number, f"🤖 **PR AutoFix Agent**\n\n{_format_report(pushed, result)}")
 
 
+async def repair_pr_ci_failure(
+    repo: str, pr: dict, files: list[dict], config: Settings, head_repo: str | None, ci_failure: dict,
+) -> None:
+    """Like repair_pr, but for a PR whose own CI check (triggered by opening/updating it) just
+    failed — feeds Claude the actual failure logs and caps retries the same way the post-merge
+    pipeline-autofix flow does, so a PR that keeps failing CI doesn't get fixed at forever."""
+    gh = GitHub(config.github_token, repo)
+    number = pr["number"]
+    branch = pr["head"]["ref"]
+
+    attempt = _attempt_number(pr)
+    if attempt >= config.max_autofix_attempts:
+        logger.info("PR CI-fix %s#%d: attempt cap (%d) reached, not retrying", repo, number, config.max_autofix_attempts)
+        if not any(label["name"] == "autofix-exhausted" for label in pr.get("labels", [])):
+            await gh.set_labels(number, _labels_with(pr, "autofix-exhausted"))
+            diagnosis = await _diagnose_exhausted(gh, branch, ci_failure, config, clone_repo=head_repo)
+            await gh.comment(
+                number,
+                f"🤖 **PR AutoFix Agent**\n\n🛑 This PR's pipeline is still failing after "
+                f"{attempt}/{config.max_autofix_attempts} automatic fix attempts. Stopping here — "
+                f"this needs a human to take a look.\n\n<details>\n<summary>Diagnosis and "
+                f"suggestions</summary>\n\n{diagnosis}\n</details>",
+            )
+        return
+
+    next_attempt = attempt + 1
+    logger.info("PR CI-fix %s#%d: starting attempt %d/%d", repo, number, next_attempt, config.max_autofix_attempts)
+    changed = "\n".join(f"- {item['filename']} ({item['status']})" for item in files[:100])
+    logs = await gh.workflow_logs(ci_failure["id"])
+    task = (
+        f"Review pull request #{number}: {pr['title']}\nChanged files:\n{changed}\n\n"
+        f"This PR's own CI check '{ci_failure['name']}' is failing (run {ci_failure['id']}, "
+        f"attempt {next_attempt} of {config.max_autofix_attempts}).\nFailed logs:\n{logs}"
+    )
+    if _touches_workflows(files):
+        task += f"\n\n{await _actions_inventory(gh)}"
+    task += "\n\nFind and safely fix this failure, plus any other actual defects in this PR."
+
+    await gh.comment(
+        number,
+        "🔍 **PR AutoFix Agent**\n\nThis PR's own pipeline failed — scanning logs and code for issues...",
+    )
+    async with lock_for(f"{repo}:{branch}"):
+        pushed, result = await _apply_fix(
+            gh, branch, task, f"fix: address CI failure for PR #{number}", config, clone_repo=head_repo
+        )
+    await gh.set_labels(number, _labels_with(pr, f"autofix-attempt-{next_attempt}"))
+    await gh.comment(
+        number,
+        f"🤖 **PR AutoFix Agent** (attempt {next_attempt}/{config.max_autofix_attempts})\n\n{_format_report(pushed, result)}",
+    )
+
+
 async def create_autofix_pr(gh: GitHub, branch_name: str, run: dict, config: Settings) -> None:
     base_branch = run["head_branch"]
     logger.info("Creating autofix PR for %s on %s (branch=%s)", run["name"], gh.repo, branch_name)
@@ -232,12 +285,14 @@ async def create_autofix_pr(gh: GitHub, branch_name: str, run: dict, config: Set
     logger.info("Autofix PR opened for %s: %s#%d", run["name"], gh.repo, pr["number"])
 
 
-async def _diagnose_exhausted(gh: GitHub, branch_name: str, run: dict, config: Settings) -> str:
+async def _diagnose_exhausted(
+    gh: GitHub, branch_name: str, run: dict, config: Settings, clone_repo: str | None = None,
+) -> str:
     """Read-only final pass once the retry cap is hit: no edits, just a diagnosis a human can act on."""
     async with _semaphore(config):
         directory = Path(tempfile.mkdtemp(prefix="pr-autofix-diag-"))
         try:
-            await asyncio.to_thread(gh.clone_branch, branch_name, directory)
+            await asyncio.to_thread(gh.clone_branch, branch_name, directory, clone_repo)
             logs = await gh.workflow_logs(run["id"])
             inventory = await _actions_inventory(gh)
             task = (
