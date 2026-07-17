@@ -151,3 +151,15 @@ class GitHub:
 
     async def create_pr(self, head: str, base: str, title: str, body: str) -> dict:
         return await self.request("POST", f"/repos/{self.repo}/pulls", json={"title": title, "head": head, "base": base, "body": body})
+
+    async def find_issue_by_title(self, title: str, label: str) -> dict | None:
+        results = await self.request(
+            "GET", f"/repos/{self.repo}/issues", params={"state": "open", "labels": label, "per_page": 100}
+        )
+        return next((i for i in results if i.get("title") == title), None)
+
+    async def create_issue(self, title: str, body: str, labels: list[str] | None = None) -> dict:
+        payload = {"title": title, "body": body}
+        if labels:
+            payload["labels"] = labels
+        return await self.request("POST", f"/repos/{self.repo}/issues", json=payload)

@@ -62,6 +62,11 @@ Every poll cycle, for each allowlisted repo:
      (`autofix/ci-<workflow-name>`), clone that branch, ask Claude to diagnose the failure from the
      run's logs (plus the current secrets/variables inventory, since a missing one is a common root
      cause) and fix it, push to a new branch, open a PR labeled `autofix-attempt-1`.
+   - If Claude finds no safe code fix at all (e.g. the cause is external — an AWS permission gap,
+     a quota limit, a third-party outage) there's no PR to open, so it opens a **GitHub issue**
+     labeled `autofix-needs-human` instead, with the full diagnosis and a link to the failed run —
+     so it's always visible on GitHub, not just in server logs. A recurring failure with the same
+     cause updates that same issue instead of opening a duplicate each time.
 
 3. **Check each open `autofix/ci-*` PR's latest completed run:**
    - Still failing → comment `🔍 Pipeline still failing — scanning logs for attempt N/max...`,

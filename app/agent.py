@@ -350,7 +350,25 @@ async def create_autofix_pr(gh: GitHub, branch_name: str, run: dict, config: Set
         gh, base_branch, task, f"fix(ci): repair failed workflow {run['name']}", config, push_branch=branch_name
     )
     if not pushed:
-        logger.info("Autofix for %s: no safe fix found, not creating a PR", run["name"])
+        # No code fix exists (e.g. an external/infra cause like an AWS permission or quota issue) —
+        # surface Claude's diagnosis as a GitHub issue instead of only logging it server-side,
+        # since there's no PR to comment on here. Dedupe by a stable title (no run ID in it) so a
+        # recurring external failure updates the same issue instead of opening a new one each time.
+        title = f"🤖 Pipeline failure needs human attention: {run['name']}"
+        report = _format_report(pushed, result)
+        run_link = f"\n\n[View run {run['id']}]({run['html_url']})" if run.get("html_url") else ""
+        existing = await gh.find_issue_by_title(title, "autofix-needs-human")
+        if existing:
+            await gh.comment(existing["number"], f"🤖 Still happening (run {run['id']}):\n\n{report}{run_link}")
+            logger.info("Autofix for %s: no safe fix, updated existing issue #%d", run["name"], existing["number"])
+        else:
+            issue = await gh.create_issue(
+                title,
+                f"Automated diagnosis for a failing pipeline on `{base_branch}` found no safe code "
+                f"fix — this needs a human to look at.\n\n{report}{run_link}",
+                labels=["autofix-needs-human"],
+            )
+            logger.info("Autofix for %s: no safe fix, opened issue #%d", run["name"], issue["number"])
         return
     pr = await gh.create_pr(
         branch_name, base_branch, f"fix(ci): repair {run['name']}",
