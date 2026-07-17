@@ -42,6 +42,14 @@ class GitHub:
     async def list_open_prs(self) -> list[dict]:
         return await self.request("GET", f"/repos/{self.repo}/pulls", params={"state": "open", "per_page": 100})
 
+    async def list_recent_prs(self) -> list[dict]:
+        # Includes merged/closed PRs too, so a branch a PR just merged into (e.g. "dev") gets
+        # learned even though the PR itself is no longer open by the time we look.
+        return await self.request(
+            "GET", f"/repos/{self.repo}/pulls",
+            params={"state": "all", "per_page": 30, "sort": "updated", "direction": "desc"},
+        )
+
     async def pr_files(self, number: int) -> list[dict]:
         return await self.request("GET", f"/repos/{self.repo}/pulls/{number}/files", params={"per_page": 100})
 

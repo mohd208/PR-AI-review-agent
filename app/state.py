@@ -27,7 +27,7 @@ class State:
         self.path.write_text(json.dumps(self.data))
 
     def _repo(self, repo: str) -> dict:
-        return self.data.setdefault(repo, {"prs": {}, "ci_runs": {}, "notified_passing": []})
+        return self.data.setdefault(repo, {"prs": {}, "ci_runs": {}, "notified_passing": [], "watched_branches": []})
 
     def get_pr_sha(self, repo: str, number: int) -> str | None:
         return self._repo(repo)["prs"].get(str(number))
@@ -57,3 +57,22 @@ class State:
         if branch in notified:
             notified.remove(branch)
             self._save()
+
+    def watched_branches(self, repo: str, default_branch: str) -> set[str]:
+        """Branches to check post-merge pipeline runs on: the repo's configured default branch,
+        plus any branch that's ever been observed as a PR's base (e.g. teams that merge into
+        "dev" rather than the GitHub-configured default get watched too, automatically)."""
+        branches = self._repo(repo).setdefault("watched_branches", [])
+        if default_branch not in branches:
+            branches.append(default_branch)
+            self._save()
+        return set(branches)
+
+    def watch_branch(self, repo: str, branch: str) -> bool:
+        """Adds a branch to the watch list. Returns True if it was newly added."""
+        branches = self._repo(repo).setdefault("watched_branches", [])
+        if branch in branches:
+            return False
+        branches.append(branch)
+        self._save()
+        return True

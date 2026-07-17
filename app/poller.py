@@ -40,15 +40,37 @@ async def poll_repo(repo: str, config: Settings, state: State) -> None:
 
     repo_info = await gh.get_repo()
     default_branch = repo_info["default_branch"]
-    tasks.append(_check_default_branch(gh, repo, default_branch, config, state))
+    watched = state.watched_branches(repo, default_branch)
+    # Watch whatever branch PRs actually merge into, not just GitHub's configured default branch —
+    # plenty of teams merge into "dev"/"develop"/"staging" and only promote to main separately.
+    # Uses recent PRs of any state (not just currently-open ones), so a branch a PR merged into
+    # gets learned even after that PR is already closed.
+    recent_prs = await gh.list_recent_prs()
+    for pr in recent_prs:
+        base = pr.get("base", {}).get("ref")
+        if base and state.watch_branch(repo, base):
+            watched.add(base)
+            # Sentinel (no real run ID is ever 0): unlike the very first look at the configured
+            # default branch on startup, discovering a branch this way means something relevant
+            # just happened (a PR merged into it) — react to whatever's failing there right now
+            # instead of silently baselining it.
+            state.set_ci_run(repo, base, 0)
+            logger.info(
+                "%s: now watching branch '%s' for post-merge pipeline failures (seen as a PR base) — "
+                "will react immediately if it's currently failing",
+                repo, base,
+            )
+
+    for branch in sorted(watched):
+        tasks.append(_check_branch_pipeline(gh, repo, branch, config, state))
     for pr in autofix_prs:
         tasks.append(_check_autofix_branch(gh, repo, pr, config, state))
 
     review_desc = ", ".join(f"#{pr['number']} ({pr['head']['ref']})" for pr in review_prs) or "none"
     autofix_desc = ", ".join(f"#{pr['number']} ({pr['head']['ref']})" for pr in autofix_prs) or "none"
     logger.info(
-        "==== %s: checking PR(s) [%s] | default branch '%s' | autofix PR(s) [%s] ====",
-        repo, review_desc, default_branch, autofix_desc,
+        "==== %s: checking PR(s) [%s] | watched branch(es) %s | autofix PR(s) [%s] ====",
+        repo, review_desc, sorted(watched), autofix_desc,
     )
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -96,15 +118,15 @@ async def _scan_pr(gh: GitHub, repo: str, pr: dict, config: Settings, state: Sta
     state.set_pr_sha(repo, number, updated["head"]["sha"])
 
 
-async def _check_default_branch(gh: GitHub, repo: str, branch: str, config: Settings, state: State) -> None:
+async def _check_branch_pipeline(gh: GitHub, repo: str, branch: str, config: Settings, state: State) -> None:
     run = await gh.latest_run(branch)
     if not run:
-        logger.info("Default branch %s@%s: no completed workflow run found yet", repo, branch)
+        logger.info("Watched branch %s@%s: no completed workflow run found yet", repo, branch)
         return
 
     last_seen = state.get_ci_run(repo, branch)
     logger.info(
-        "Default branch %s@%s: latest run=%s (%s) conclusion=%s, last_seen=%s",
+        "Watched branch %s@%s: latest run=%s (%s) conclusion=%s, last_seen=%s",
         repo, branch, run["id"], run.get("name"), run.get("conclusion"), last_seen,
     )
     if last_seen is None:
@@ -119,7 +141,7 @@ async def _check_default_branch(gh: GitHub, repo: str, branch: str, config: Sett
         )
         return
     if run["id"] == last_seen:
-        logger.info("Default branch %s@%s: run=%s already handled, nothing new", repo, branch, run["id"])
+        logger.info("Watched branch %s@%s: run=%s already handled, nothing new", repo, branch, run["id"])
         return
 
     if run.get("conclusion") == "failure":
@@ -128,16 +150,16 @@ async def _check_default_branch(gh: GitHub, repo: str, branch: str, config: Sett
             existing_pr = await gh.find_pr_by_branch(branch_name)
             if existing_pr:
                 logger.info(
-                    "Default branch %s@%s failed (run=%s) but %s#%d is already open for that "
+                    "Watched branch %s@%s failed (run=%s) but %s#%d is already open for that "
                     "workflow — not creating another PR. If that PR is stuck/exhausted, close or "
                     "merge it so a fresh failure can open a new one.",
                     repo, branch, run["id"], repo, existing_pr["number"],
                 )
             else:
-                logger.info("Default branch %s@%s: new failure (run=%s), creating autofix PR", repo, branch, run["id"])
+                logger.info("Watched branch %s@%s: new failure (run=%s), creating autofix PR", repo, branch, run["id"])
                 await create_autofix_pr(gh, branch_name, run, config)
     else:
-        logger.info("Default branch %s@%s: run=%s concluded '%s', nothing to fix", repo, branch, run["id"], run.get("conclusion"))
+        logger.info("Watched branch %s@%s: run=%s concluded '%s', nothing to fix", repo, branch, run["id"], run.get("conclusion"))
     state.set_ci_run(repo, branch, run["id"])
 
 

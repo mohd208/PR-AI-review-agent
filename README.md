@@ -47,14 +47,21 @@ Every poll cycle, for each allowlisted repo:
      recorded, so the next poll doesn't re-react to our own commit or the same already-seen run —
      this is what replaces webhook loop-prevention entirely.
 
-2. **Check the default branch's latest completed pipeline run.** The very first time the agent
-   observes a branch, it just records that run as a baseline and does nothing else — so it never
-   "fixes" some pre-existing failure that was already there before the agent started watching (or
-   before your PR review even happened). From then on, whenever a *new* run appears and it failed:
-   derive a branch name from the workflow (`autofix/ci-<workflow-name>`), clone the default branch,
-   ask Claude to diagnose the failure from the run's logs (plus the current secrets/variables
-   inventory, since a missing one is a common root cause) and fix it, push to the new branch, open
-   a PR labeled `autofix-attempt-1`.
+2. **Check every "watched branch"'s latest completed pipeline run** — not just the repo's
+   GitHub-configured default branch. The watch list always includes the default branch, plus every
+   branch ever seen as a PR's base (learned from recent PRs of any state, so it still gets learned
+   even after that PR is merged/closed) — so teams that merge into `dev`/`develop`/`staging` and
+   only promote to `main` separately are covered too, automatically, with no configuration needed.
+   - The very first time the agent observes the *default* branch (e.g. on first startup), it just
+     records that run as a baseline and does nothing else — so it never "fixes" some pre-existing
+     failure that predates the agent watching it.
+   - A branch discovered *later* by being seen as a PR's base is treated differently: since
+     something relevant clearly just happened (a PR merged into it), the agent reacts immediately
+     if it's currently failing, instead of silently baselining it.
+   - Either way, whenever a *new* run appears and it failed: derive a branch name from the workflow
+     (`autofix/ci-<workflow-name>`), clone that branch, ask Claude to diagnose the failure from the
+     run's logs (plus the current secrets/variables inventory, since a missing one is a common root
+     cause) and fix it, push to a new branch, open a PR labeled `autofix-attempt-1`.
 
 3. **Check each open `autofix/ci-*` PR's latest completed run:**
    - Still failing → comment `🔍 Pipeline still failing — scanning logs for attempt N/max...`,
@@ -125,7 +132,7 @@ everything is driven by polling.
 
 ## Operational notes
 
-Pipeline autofix only creates a *new* PR from the default branch's own runs; failures on an
+Pipeline autofix only creates a *new* PR from a watched branch's own runs; failures on an
 unrelated contributor's PR checks are left to the PR-review flow instead. Before enabling this in
 a production repository, add branch protection and review the GitHub App/token permissions.
 
