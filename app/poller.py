@@ -25,22 +25,31 @@ async def poll_forever(config: Settings, state: State) -> None:
 async def poll_repo(repo: str, config: Settings, state: State) -> None:
     gh = GitHub(config.github_token, repo)
     prs = await gh.list_open_prs()
-    logger.info("Poll %s: %d open PR(s)", repo, len(prs))
 
-    tasks = []
+    review_prs = []
     autofix_prs = []
     for pr in prs:
         if pr["head"]["ref"].startswith(AUTOFIX_PREFIX):
             # These are handled by the pipeline-failure flow below, not the generic review —
             # otherwise a single fix commit would trigger two independent Claude passes on it.
             autofix_prs.append(pr)
-            continue
-        tasks.append(_scan_pr(gh, repo, pr, config, state))
+        else:
+            review_prs.append(pr)
+
+    tasks = [_scan_pr(gh, repo, pr, config, state) for pr in review_prs]
 
     repo_info = await gh.get_repo()
-    tasks.append(_check_default_branch(gh, repo, repo_info["default_branch"], config, state))
+    default_branch = repo_info["default_branch"]
+    tasks.append(_check_default_branch(gh, repo, default_branch, config, state))
     for pr in autofix_prs:
         tasks.append(_check_autofix_branch(gh, repo, pr, config, state))
+
+    review_desc = ", ".join(f"#{pr['number']} ({pr['head']['ref']})" for pr in review_prs) or "none"
+    autofix_desc = ", ".join(f"#{pr['number']} ({pr['head']['ref']})" for pr in autofix_prs) or "none"
+    logger.info(
+        "==== %s: checking PR(s) [%s] | default branch '%s' | autofix PR(s) [%s] ====",
+        repo, review_desc, default_branch, autofix_desc,
+    )
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     for result in results:

@@ -19,6 +19,9 @@ if hasattr(os, "geteuid") and os.geteuid() == 0:
     )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+# httpx logs one INFO line per API call ("HTTP Request: GET ..."), which drowns out the actual
+# narrative of what the agent is doing. The status lines from app.* below say what mattered anyway.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
