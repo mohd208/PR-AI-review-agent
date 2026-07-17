@@ -67,6 +67,11 @@ async def _scan_pr(gh: GitHub, repo: str, pr: dict, config: Settings, state: Sta
     # the commit that triggered it was already reviewed.
     ci_failure = await _latest_failed_run_for_sha(gh, sha)
     ci_is_new = ci_failure is not None and state.get_ci_run(repo, branch) != ci_failure["id"]
+    logger.info(
+        "PR %s#%d (branch=%s sha=%s): sha_changed=%s ci_failure=%s ci_is_new=%s",
+        repo, number, branch, sha[:8], sha_changed,
+        f"{ci_failure['name']}#{ci_failure['id']}" if ci_failure else None, ci_is_new,
+    )
 
     if not sha_changed and not ci_is_new:
         return
@@ -85,28 +90,45 @@ async def _scan_pr(gh: GitHub, repo: str, pr: dict, config: Settings, state: Sta
 async def _check_default_branch(gh: GitHub, repo: str, branch: str, config: Settings, state: State) -> None:
     run = await gh.latest_run(branch)
     if not run:
+        logger.info("Default branch %s@%s: no completed workflow run found yet", repo, branch)
         return
 
     last_seen = state.get_ci_run(repo, branch)
+    logger.info(
+        "Default branch %s@%s: latest run=%s (%s) conclusion=%s, last_seen=%s",
+        repo, branch, run["id"], run.get("name"), run.get("conclusion"), last_seen,
+    )
     if last_seen is None:
         # First time watching this branch — record a baseline without reacting. Otherwise, on
         # first startup (or a newly allowlisted repo) we'd "fix" whatever failure happened to
         # already be sitting there, rather than only reacting to failures from this point on.
         state.set_ci_run(repo, branch, run["id"])
         logger.info(
-            "Baseline recorded for %s@%s: run=%s conclusion=%s (not reacting to pre-existing runs)",
+            "Baseline recorded for %s@%s: run=%s conclusion=%s (not reacting to pre-existing runs — "
+            "the *next* new failed run after this one is what will trigger an autofix PR)",
             repo, branch, run["id"], run.get("conclusion"),
         )
         return
     if run["id"] == last_seen:
+        logger.info("Default branch %s@%s: run=%s already handled, nothing new", repo, branch, run["id"])
         return
 
     if run.get("conclusion") == "failure":
         branch_name = f"{AUTOFIX_PREFIX}{slug(run['name'])}"
         async with lock_for(f"{repo}:{branch_name}"):
             existing_pr = await gh.find_pr_by_branch(branch_name)
-            if not existing_pr:
+            if existing_pr:
+                logger.info(
+                    "Default branch %s@%s failed (run=%s) but %s#%d is already open for that "
+                    "workflow — not creating another PR. If that PR is stuck/exhausted, close or "
+                    "merge it so a fresh failure can open a new one.",
+                    repo, branch, run["id"], repo, existing_pr["number"],
+                )
+            else:
+                logger.info("Default branch %s@%s: new failure (run=%s), creating autofix PR", repo, branch, run["id"])
                 await create_autofix_pr(gh, branch_name, run, config)
+    else:
+        logger.info("Default branch %s@%s: run=%s concluded '%s', nothing to fix", repo, branch, run["id"], run.get("conclusion"))
     state.set_ci_run(repo, branch, run["id"])
 
 
@@ -114,9 +136,14 @@ async def _check_autofix_branch(gh: GitHub, repo: str, pr: dict, config: Setting
     branch = pr["head"]["ref"]
     run = await gh.latest_run(branch)
     if not run:
+        logger.info("Autofix PR %s#%d (branch=%s): no completed run found yet", repo, pr["number"], branch)
         return
     if state.get_ci_run(repo, branch) == run["id"]:
         return
+    logger.info(
+        "Autofix PR %s#%d (branch=%s): latest run=%s conclusion=%s",
+        repo, pr["number"], branch, run["id"], run.get("conclusion"),
+    )
 
     if run.get("conclusion") == "failure":
         state.clear_notified_passing(repo, branch)

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import re
 import shutil
@@ -134,23 +135,101 @@ async def _actions_inventory(gh: GitHub) -> str:
     )
 
 
+def _summarize_claude_event(event: dict) -> str | None:
+    """Best-effort human-readable summary of one stream-json event for live logging. Returns
+    None for events not worth their own log line (the raw line is logged instead in that case).
+    The exact tool-call event shape isn't fully documented, so this is deliberately defensive —
+    unrecognized shapes just fall through rather than raising."""
+    etype = event.get("type")
+    if etype == "system":
+        subtype = event.get("subtype", "")
+        if subtype == "init":
+            return f"session started (model={event.get('model', '?')}, {len(event.get('tools', []))} tools available)"
+        return f"system: {subtype}" if subtype else None
+    if etype in ("assistant", "user"):
+        content = event.get("message", {}).get("content", [])
+        if isinstance(content, str):
+            return content[:300].replace("\n", " ") or None
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                text = block.get("text", "").strip()
+                if text:
+                    parts.append(text[:300].replace("\n", " "))
+            elif btype == "tool_use":
+                raw_input = json.dumps(block.get("input", {}))[:200]
+                parts.append(f"-> tool_use {block.get('name')}({raw_input})")
+            elif btype == "tool_result":
+                result_content = block.get("content")
+                if isinstance(result_content, list):
+                    result_content = " ".join(b.get("text", "") for b in result_content if isinstance(b, dict))
+                parts.append(f"<- tool_result: {str(result_content)[:300].replace(chr(10), ' ')}")
+        return " | ".join(p for p in parts if p) or None
+    if etype == "result":
+        return f"final result: {event.get('subtype', 'unknown')}"
+    return None
+
+
 async def invoke_claude(directory: Path, task: str, config: Settings) -> str:
     prompt = f"{SYSTEM_RULES}\n\nTask:\n{task}"
     logger.info("Invoking Claude Code in %s (timeout=%ds)", directory, config.claude_timeout_seconds)
     started = time.monotonic()
     process = await asyncio.create_subprocess_exec(
         config.claude_command, "-p", prompt, "--dangerously-skip-permissions",
-        cwd=directory, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+        cwd=directory, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
+
+    lines: list[str] = []
+    final_text: list[str] = []
+
+    async def _pump_stdout() -> None:
+        assert process.stdout is not None
+        async for raw in process.stdout:
+            line = raw.decode(errors="replace").rstrip("\n")
+            if not line:
+                continue
+            lines.append(line)
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                logger.info("[claude] %s", line[:500])
+                continue
+            if event.get("type") == "stream_event":
+                continue  # token-level deltas — too noisy; the assembled turn events cover this
+            summary = _summarize_claude_event(event)
+            if summary:
+                logger.info("[claude] %s", summary)
+            if event.get("type") == "result":
+                final_text.append(event.get("result") or event.get("text") or "")
+
+    async def _pump_stderr() -> None:
+        assert process.stderr is not None
+        async for raw in process.stderr:
+            text = raw.decode(errors="replace").rstrip("\n")
+            if text:
+                logger.warning("[claude:stderr] %s", text[:500])
+
     try:
-        output, _ = await asyncio.wait_for(process.communicate(), timeout=config.claude_timeout_seconds)
+        await asyncio.wait_for(
+            asyncio.gather(_pump_stdout(), _pump_stderr(), process.wait()),
+            timeout=config.claude_timeout_seconds,
+        )
     except TimeoutError:
         process.kill()
-        await process.communicate()
+        await process.wait()
         logger.warning("Claude Code timed out after %.0fs in %s", time.monotonic() - started, directory)
         return "Claude timed out before completing a fix."
+
     logger.info("Claude Code finished in %.0fs (exit=%s) in %s", time.monotonic() - started, process.returncode, directory)
-    return output.decode(errors="replace")[-12000:]
+    if final_text and final_text[-1]:
+        return final_text[-1][-12000:]
+    # Fallback in case the "result" event wasn't found/parsed as expected (e.g. a Claude Code
+    # version whose stream-json shape differs from what's assumed above) — never return nothing.
+    return "\n".join(lines)[-12000:]
 
 
 async def _apply_fix(
