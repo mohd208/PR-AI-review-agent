@@ -12,13 +12,20 @@ AUTOFIX_PREFIX = "autofix/ci-"
 
 
 async def poll_forever(config: Settings, state: State) -> None:
-    logger.info("Polling started: every %ds across %d repo(s)", config.poll_interval_seconds, len(config.allowed_repos))
+    repos = list(config.allowed_repos)
+    logger.info("Polling started: every %ds across %d repo(s)", config.poll_interval_seconds, len(repos))
     while True:
-        for repo in config.allowed_repos:
-            try:
-                await poll_repo(repo, config, state)
-            except Exception:
-                logger.exception("Poll cycle failed for %s", repo)
+        # Repos are polled concurrently, not one-at-a-time — a slow fix in one repo (a real
+        # Claude invocation can take minutes) must not delay checking any other repo. Actual
+        # `claude` subprocess concurrency is still bounded globally by MAX_CONCURRENT_REPAIRS
+        # (a single semaphore shared across all repos, not per-repo), so this doesn't change how
+        # many fixes can run at once — it only stops unrelated repos from queuing behind one.
+        results = await asyncio.gather(
+            *(poll_repo(repo, config, state) for repo in repos), return_exceptions=True,
+        )
+        for repo, result in zip(repos, results):
+            if isinstance(result, Exception):
+                logger.error("Poll cycle failed for %s", repo, exc_info=result)
         await asyncio.sleep(config.poll_interval_seconds)
 
 
