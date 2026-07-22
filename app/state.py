@@ -24,7 +24,7 @@ class State:
         return {}
 
     def _save(self) -> None:
-        self.path.write_text(json.dumps(self.data))
+        self.path.write_text(json.dumps(self.data, indent=2, sort_keys=True))
 
     def _repo(self, repo: str) -> dict:
         return self.data.setdefault(repo, {"prs": {}, "ci_runs": {}, "notified_passing": [], "watched_branches": []})
