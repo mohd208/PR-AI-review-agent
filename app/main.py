@@ -6,10 +6,14 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 
+from . import activity
 from .config import settings
 from .poller import poll_forever
 from .state import State
+
+DASHBOARD_HTML = (Path(__file__).parent / "dashboard.html").read_text()
 
 if hasattr(os, "geteuid") and os.geteuid() == 0:
     sys.exit(
@@ -41,3 +45,13 @@ app = FastAPI(title="PR AutoFix Agent", lifespan=lifespan)
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    return DASHBOARD_HTML
+
+
+@app.get("/api/activity")
+async def activity_snapshot():
+    return activity.snapshot()

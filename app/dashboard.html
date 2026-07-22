@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PR AutoFix Agent — Live Activity</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --blue: #58a6ff;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --red: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    padding: 24px;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+  .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  .section-title {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--muted); margin: 28px 0 10px;
+  }
+  .empty { color: var(--muted); font-size: 13px; padding: 12px 0; }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 14px; margin-bottom: 8px; display: flex; align-items: center; gap: 12px;
+  }
+  .spinner {
+    width: 16px; height: 16px; border-radius: 50%;
+    border: 2px solid var(--border); border-top-color: var(--blue);
+    animation: spin 0.8s linear infinite; flex-shrink: 0;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .card-body { flex: 1; min-width: 0; }
+  .card-label { font-weight: 600; font-size: 13px; }
+  .card-message { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .card-time { color: var(--muted); font-size: 11px; white-space: nowrap; }
+
+  .event {
+    display: flex; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border);
+    font-size: 13px; align-items: baseline;
+  }
+  .event:last-child { border-bottom: none; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; position: relative; top: 1px; }
+  .dot.working { background: var(--blue); }
+  .dot.success { background: var(--green); }
+  .dot.info { background: var(--muted); }
+  .dot.warning { background: var(--yellow); }
+  .dot.error { background: var(--red); }
+  .event-label { font-weight: 600; white-space: nowrap; }
+  .event-message { color: var(--text); flex: 1; }
+  .event-time { color: var(--muted); font-size: 11px; white-space: nowrap; }
+
+  #status-dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--green); margin-right: 6px;
+  }
+</style>
+</head>
+<body>
+  <h1><span id="status-dot"></span>PR AutoFix Agent</h1>
+  <div class="subtitle">Live activity — refreshes every 2s</div>
+
+  <div class="section-title">Currently working</div>
+  <div id="current"></div>
+
+  <div class="section-title">Recent activity</div>
+  <div id="events"></div>
+
+<script>
+function timeAgo(ts) {
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+  if (s < 5) return "just now";
+  if (s < 60) return s + "s ago";
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + "m ago";
+  const h = Math.floor(m / 60);
+  return h + "h ago";
+}
+
+function render(data) {
+  const currentEl = document.getElementById("current");
+  const eventsEl = document.getElementById("events");
+
+  if (data.current.length === 0) {
+    currentEl.innerHTML = '<div class="empty">Nothing in progress right now — idle, waiting for the next poll cycle.</div>';
+  } else {
+    currentEl.innerHTML = data.current.map(c => `
+      <div class="card">
+        <div class="spinner"></div>
+        <div class="card-body">
+          <div class="card-label">${escapeHtml(c.repo)} · ${escapeHtml(c.ref)}</div>
+          <div class="card-message">${escapeHtml(c.message)}</div>
+        </div>
+        <div class="card-time">${timeAgo(c.ts)}</div>
+      </div>
+    `).join("");
+  }
+
+  if (data.events.length === 0) {
+    eventsEl.innerHTML = '<div class="empty">No activity yet.</div>';
+  } else {
+    eventsEl.innerHTML = data.events.map(e => `
+      <div class="event">
+        <span class="dot ${e.kind}"></span>
+        <span class="event-label">${escapeHtml(e.repo)} · ${escapeHtml(e.ref)}</span>
+        <span class="event-message">${escapeHtml(e.message)}</span>
+        <span class="event-time">${timeAgo(e.ts)}</span>
+      </div>
+    `).join("");
+  }
+}
+
+function escapeHtml(s) {
+  const div = document.createElement("div");
+  div.textContent = s == null ? "" : String(s);
+  return div.innerHTML;
+}
+
+async function refresh() {
+  try {
+    const res = await fetch("/api/activity");
+    render(await res.json());
+    document.getElementById("status-dot").style.background = "#3fb950";
+  } catch (e) {
+    document.getElementById("status-dot").style.background = "#f85149";
+  }
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

@@ -8,6 +8,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from . import activity
 from .config import Settings
 from .github import CloneFailed, GitHub, PushRejected
 
@@ -234,13 +235,15 @@ async def invoke_claude(directory: Path, task: str, config: Settings) -> str:
 
 async def _apply_fix(
     gh: GitHub, source_branch: str, task: str, commit_message: str, config: Settings,
-    push_branch: str | None = None, clone_repo: str | None = None,
+    push_branch: str | None = None, clone_repo: str | None = None, label: str = "",
 ) -> tuple[bool, str]:
     async with _semaphore(config):
         directory = Path(tempfile.mkdtemp(prefix="pr-autofix-"))
         target_branch = push_branch or source_branch
         try:
             logger.info("Cloning %s (repo=%s) into %s", source_branch, clone_repo or gh.repo, directory)
+            if label:
+                activity.set_current(gh.repo, label, "Cloning repository...")
             try:
                 # Runs in a worker thread — it's a blocking subprocess call, and letting it block
                 # the asyncio event loop would freeze the whole server (all repos, /healthz, etc.)
@@ -248,9 +251,13 @@ async def _apply_fix(
                 await asyncio.to_thread(gh.clone_branch, source_branch, directory, clone_repo)
             except CloneFailed as exc:
                 logger.warning("Clone of %s failed: %s", source_branch, exc)
+                if label:
+                    activity.log_event(gh.repo, label, "error", f"Could not clone the repository: {exc}")
                 return False, f"Could not clone branch `{source_branch}`: {exc}"
             if push_branch:
                 subprocess.run(["git", "checkout", "-b", push_branch], cwd=directory, check=True)
+            if label:
+                activity.set_current(gh.repo, label, "Thinking — analyzing and fixing...")
             result = await invoke_claude(directory, task, config)
             try:
                 pushed = await asyncio.to_thread(gh.commit_and_push, directory, target_branch, commit_message)
@@ -262,8 +269,16 @@ async def _apply_fix(
                     f"\n\n(A fix was computed but could not be pushed: {exc}\n"
                     "This usually means the branch is on a fork without \"Allow edits from maintainers\" enabled.)"
                 )
+                if label:
+                    activity.log_event(gh.repo, label, "warning", "Found a fix but could not push it (see PR comment)")
+            if label and pushed:
+                activity.log_event(gh.repo, label, "success", "Found an issue and pushed a fix")
+            elif label and pushed is False and "could not be pushed" not in result[-300:]:
+                activity.log_event(gh.repo, label, "info", "Checked it — no safe fix was needed")
             return pushed, result
         finally:
+            if label:
+                activity.clear_current(gh.repo, label)
             shutil.rmtree(directory, ignore_errors=True)
 
 
@@ -272,6 +287,8 @@ async def repair_pr(
     head_repo: str | None = None,
 ) -> None:
     gh = GitHub(config.github_token, repo)
+    label = f"PR #{number}"
+    activity.log_event(repo, label, "working", f"Picked up PR #{number} ({title}) — scanning for issues")
     changed = "\n".join(f"- {item['filename']} ({item['status']})" for item in files[:100])
     task = f"Review pull request #{number}: {title}\nChanged files:\n{changed}\nFind and safely fix actual defects in this PR."
     if _touches_workflows(files):
@@ -279,7 +296,8 @@ async def repair_pr(
     await gh.comment(number, "🔍 **PR AutoFix Agent**\n\nScanning this PR for issues...")
     async with lock_for(f"{repo}:{branch}"):
         pushed, result = await _apply_fix(
-            gh, branch, task, f"fix: address automated review for PR #{number}", config, clone_repo=head_repo
+            gh, branch, task, f"fix: address automated review for PR #{number}", config,
+            clone_repo=head_repo, label=label,
         )
     await gh.comment(number, f"🤖 **PR AutoFix Agent**\n\n{_format_report(pushed, result)}")
 
@@ -293,12 +311,14 @@ async def repair_pr_ci_failure(
     gh = GitHub(config.github_token, repo)
     number = pr["number"]
     branch = pr["head"]["ref"]
+    label = f"PR #{number}"
 
     attempt = _attempt_number(pr)
     if attempt >= config.max_autofix_attempts:
         logger.info("PR CI-fix %s#%d: attempt cap (%d) reached, not retrying", repo, number, config.max_autofix_attempts)
-        if not any(label["name"] == "autofix-exhausted" for label in pr.get("labels", [])):
+        if not any(lbl["name"] == "autofix-exhausted" for lbl in pr.get("labels", [])):
             await gh.set_labels(number, _labels_with(pr, "autofix-exhausted"))
+            activity.log_event(repo, label, "error", f"Pipeline still failing after {attempt} attempts — needs a human")
             diagnosis = await _diagnose_exhausted(gh, branch, ci_failure, config, clone_repo=head_repo)
             await gh.comment(
                 number,
@@ -311,6 +331,7 @@ async def repair_pr_ci_failure(
 
     next_attempt = attempt + 1
     logger.info("PR CI-fix %s#%d: starting attempt %d/%d", repo, number, next_attempt, config.max_autofix_attempts)
+    activity.log_event(repo, label, "working", f"Picked up PR #{number} — its own pipeline check failed, investigating")
     changed = "\n".join(f"- {item['filename']} ({item['status']})" for item in files[:100])
     logs = await gh.workflow_logs(ci_failure["id"])
     task = (
@@ -328,7 +349,8 @@ async def repair_pr_ci_failure(
     )
     async with lock_for(f"{repo}:{branch}"):
         pushed, result = await _apply_fix(
-            gh, branch, task, f"fix: address CI failure for PR #{number}", config, clone_repo=head_repo
+            gh, branch, task, f"fix: address CI failure for PR #{number}", config,
+            clone_repo=head_repo, label=label,
         )
     await gh.set_labels(number, _labels_with(pr, f"autofix-attempt-{next_attempt}"))
     await gh.comment(
@@ -339,7 +361,9 @@ async def repair_pr_ci_failure(
 
 async def create_autofix_pr(gh: GitHub, branch_name: str, run: dict, config: Settings) -> None:
     base_branch = run["head_branch"]
+    label = f"CI: {run['name']}"
     logger.info("Creating autofix PR for %s on %s (branch=%s)", run["name"], gh.repo, branch_name)
+    activity.log_event(gh.repo, label, "working", f"Pipeline '{run['name']}' failed on {base_branch} — investigating")
     logs = await gh.workflow_logs(run["id"])
     inventory = await _actions_inventory(gh)
     task = (
@@ -347,7 +371,8 @@ async def create_autofix_pr(gh: GitHub, branch_name: str, run: dict, config: Set
         f"{inventory}\n\nDiagnose and safely fix the root cause."
     )
     pushed, result = await _apply_fix(
-        gh, base_branch, task, f"fix(ci): repair failed workflow {run['name']}", config, push_branch=branch_name
+        gh, base_branch, task, f"fix(ci): repair failed workflow {run['name']}", config,
+        push_branch=branch_name, label=label,
     )
     if not pushed:
         # No code fix exists (e.g. an external/infra cause like an AWS permission or quota issue) —
@@ -361,6 +386,7 @@ async def create_autofix_pr(gh: GitHub, branch_name: str, run: dict, config: Set
         if existing:
             await gh.comment(existing["number"], f"🤖 Still happening (run {run['id']}):\n\n{report}{run_link}")
             logger.info("Autofix for %s: no safe fix, updated existing issue #%d", run["name"], existing["number"])
+            activity.log_event(gh.repo, label, "warning", f"Still no safe fix — updated issue #{existing['number']}")
         else:
             issue = await gh.create_issue(
                 title,
@@ -369,6 +395,7 @@ async def create_autofix_pr(gh: GitHub, branch_name: str, run: dict, config: Set
                 labels=["autofix-needs-human"],
             )
             logger.info("Autofix for %s: no safe fix, opened issue #%d", run["name"], issue["number"])
+            activity.log_event(gh.repo, label, "warning", f"No safe fix found — opened issue #{issue['number']}")
         return
     pr = await gh.create_pr(
         branch_name, base_branch, f"fix(ci): repair {run['name']}",
@@ -380,6 +407,7 @@ async def create_autofix_pr(gh: GitHub, branch_name: str, run: dict, config: Set
         f"🤖 This PR was opened automatically after a post-merge CI failure (attempt 1/{config.max_autofix_attempts}).",
     )
     logger.info("Autofix PR opened for %s: %s#%d", run["name"], gh.repo, pr["number"])
+    activity.log_event(gh.repo, label, "success", f"Fixed it — opened PR #{pr['number']}")
 
 
 async def _diagnose_exhausted(
@@ -406,11 +434,13 @@ async def _diagnose_exhausted(
 
 
 async def retry_autofix(gh: GitHub, pr: dict, branch_name: str, run: dict, config: Settings) -> None:
+    label = f"PR #{pr['number']}"
     attempt = _attempt_number(pr)
     if attempt >= config.max_autofix_attempts:
         logger.info("Autofix %s#%d: attempt cap (%d) reached, not retrying", gh.repo, pr["number"], config.max_autofix_attempts)
-        if not any(label["name"] == "autofix-exhausted" for label in pr.get("labels", [])):
+        if not any(lbl["name"] == "autofix-exhausted" for lbl in pr.get("labels", [])):
             await gh.set_labels(pr["number"], _labels_with(pr, "autofix-exhausted"))
+            activity.log_event(gh.repo, label, "error", f"Pipeline still failing after {attempt} attempts — needs a human")
             diagnosis = await _diagnose_exhausted(gh, branch_name, run, config)
             await gh.comment(
                 pr["number"],
@@ -422,6 +452,7 @@ async def retry_autofix(gh: GitHub, pr: dict, branch_name: str, run: dict, confi
 
     next_attempt = attempt + 1
     logger.info("Autofix %s#%d: starting attempt %d/%d", gh.repo, pr["number"], next_attempt, config.max_autofix_attempts)
+    activity.log_event(gh.repo, label, "working", f"Pipeline for PR #{pr['number']} still failing — retry {next_attempt}")
     await gh.comment(
         pr["number"],
         f"🔍 **PR AutoFix Agent**\n\nPipeline still failing — scanning logs for attempt "
@@ -434,7 +465,9 @@ async def retry_autofix(gh: GitHub, pr: dict, branch_name: str, run: dict, confi
         f"attempt on this branch (attempt {next_attempt} of {config.max_autofix_attempts}).\n"
         f"Failed logs:\n{logs}\n\n{inventory}\n\nDiagnose and safely fix the root cause."
     )
-    pushed, result = await _apply_fix(gh, branch_name, task, f"fix(ci): retry {next_attempt} for {run['name']}", config)
+    pushed, result = await _apply_fix(
+        gh, branch_name, task, f"fix(ci): retry {next_attempt} for {run['name']}", config, label=label
+    )
     await gh.set_labels(pr["number"], _labels_with(pr, f"autofix-attempt-{next_attempt}"))
     await gh.comment(
         pr["number"],
